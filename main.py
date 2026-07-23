@@ -11,8 +11,13 @@ CHAT_ID = os.environ.get("CHAT_ID")
 if not TELEGRAM_TOKEN or not CHAT_ID:
     raise RuntimeError("TELEGRAM_TOKEN ou CHAT_ID manquant dans les variables d'environnement")
 
-active_tokens = {}
-seen_mints = set()  # évite de re-alerter le même token à chaque cycle
+active_tokens = {}      # tokens alertés, en cours de suivi ATH
+seen_mints = set()      # mints déjà ALERTÉS (pour ne jamais ré-alerter le même token)
+pending_mints = {}      # mints vus mais PAS ENCORE migrés : mint -> premier vu (timestamp)
+
+# Un mint en attente de migration est abandonné après ce délai (il ne migrera
+# probablement plus, inutile de continuer à interroger l'API pour lui).
+PENDING_MAX_AGE = 24 * 3600  # 24h
 
 # --- FILTRES DE QUALITÉ ---
 # Ces seuils réduisent le bruit (tokens sans intérêt / scams grossiers)
@@ -91,12 +96,89 @@ def send_telegram_message(message):
         print(f"Erreur d'envoi Telegram : {e}")
 
 
+def fetch_pair_data(mint):
+    """Récupère la 1ère pair DexScreener connue pour un mint, ou None."""
+    try:
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+        res = requests.get(url, timeout=5)
+        if res.status_code != 200:
+            return None
+        pairs = res.json().get("pairs")
+        return pairs[0] if pairs else None
+    except Exception as e:
+        print(f"[fetch_pair_data] erreur pour {mint} : {e}")
+        return None
+
+
+def essayer_alerter(mint, pair, source_url):
+    """
+    Vérifie si le pair migré passe les filtres + RugCheck, et alerte si oui.
+
+    C'EST ICI qu'on capture le market cap "initial" utilisé pour le
+    multiplicateur du rapport 30 min. Cette fonction est appelée soit :
+    - dès la découverte du mint si le pool est déjà migré à ce moment-là,
+    - soit à chaque cycle (10s) tant qu'il est en attente dans pending_mints,
+    de façon à capter le market cap au tout premier instant où le pool
+    migré (Raydium/PumpSwap) est visible — et non au moment (potentiellement
+    tardif) où le bot a simplement fini par scanner le token.
+
+    Retourne True si le token a été alerté (à retirer de pending_mints),
+    False sinon.
+    """
+    base_token = pair.get("baseToken") or {}
+    name = base_token.get("name", "Inconnu")
+    symbol = base_token.get("symbol", "Inconnu")
+    market_cap = pair.get("marketCap", 0) or pair.get("fdv", 0) or 0
+    liquidity_usd = (pair.get("liquidity") or {}).get("usd", 0)
+    dex_name = pair.get("dexId", "DEX inconnu")
+    pair_url_link = pair.get("url", source_url)
+
+    if pair.get("dexId") not in DEX_MIGRES:
+        print(f"[non migré] {symbol} ({mint}) — dex={pair.get('dexId')}")
+        return False
+
+    if not passe_les_filtres(market_cap, liquidity_usd):
+        print(f"[filtré] {symbol} ({mint}) — MC=${market_cap:,.0f} Liq=${liquidity_usd:,.0f}")
+        return False
+
+    rug_ok, rug_score, rug_flags = rugcheck_verdict(mint)
+    if not rug_ok:
+        print(f"[rugcheck] {symbol} ({mint}) rejeté — score={rug_score} flags={rug_flags}")
+        return False
+
+    flags_txt = ", ".join(rug_flags) if rug_flags else "Aucun"
+    msg_ok = (
+        f"✅ *Nouveau Token Solana Détecté !*\n\n"
+        f"🪙 Nom : {name} ({symbol})\n"
+        f"🏦 DEX : {dex_name}\n"
+        f"📊 Market Cap / FDV : ${market_cap:,.0f}\n"
+        f"💧 Liquidité USD : ${liquidity_usd:,.0f}\n"
+        f"🛡️ RugCheck Score : {rug_score}/100\n"
+        f"🚩 Flags : {flags_txt}\n"
+        f"🔗 [Voir sur DexScreener]({pair_url_link})\n"
+        f"🔍 [Voir sur RugCheck](https://rugcheck.xyz/tokens/{mint})"
+    )
+    send_telegram_message(msg_ok)
+    print(f"Alerte envoyée pour : {symbol} ({mint}) — RugCheck score={rug_score}")
+
+    active_tokens[mint] = {
+        "symbol": symbol,
+        "initial_mc": market_cap or 1.0,
+        "max_price": market_cap or 1.0,
+        "start_time": time.time(),
+        "dex_url": pair_url_link,  # <-- pour le lien dans le rapport 30 min
+    }
+    seen_mints.add(mint)
+    return True
+
+
 def check_new_solana_tokens():
     """
-    Récupère les derniers profils de tokens soumis sur DexScreener
-    et filtre sur la chaîne Solana. C'est le bon endpoint : l'ancien
-    /latest/dex/tokens/solana n'existe pas (il attend une adresse de
-    token, pas un nom de chaîne), d'où l'absence d'alertes.
+    Découvre de nouveaux mints Solana via le flux de profils DexScreener.
+    Un mint déjà alerté (seen_mints) ou déjà suivi (pending_mints /
+    active_tokens) n'est pas retraité ici. S'il n'est pas encore migré,
+    on le place en attente : check_pending_tokens() le re-vérifiera à
+    chaque cycle pour capter le tout premier instant de migration.
     """
     try:
         url = "https://api.dexscreener.com/token-profiles/latest/v1"
@@ -116,73 +198,54 @@ def check_new_solana_tokens():
                 continue
 
             mint = profile.get("tokenAddress")
-            if not mint or mint in seen_mints:
+            if not mint:
+                continue
+            if mint in seen_mints or mint in pending_mints or mint in active_tokens:
                 continue
 
-            seen_mints.add(mint)
+            pair = fetch_pair_data(mint)
+            source_url = profile.get("url", "https://dexscreener.com/solana")
 
-            # On va chercher les infos de marché (prix, liquidité) via l'endpoint pairs
-            pair_url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
-            pair_res = requests.get(pair_url, timeout=5)
-            pairs = pair_res.json().get("pairs") if pair_res.status_code == 200 else None
-            pair = pairs[0] if pairs else None
-
-            name = symbol = "Inconnu"
-            market_cap = 0
-            liquidity_usd = 0
-            dex_name = "DEX inconnu"
-            pair_url_link = profile.get("url", "https://dexscreener.com/solana")
-
-            if pair:
-                base_token = pair.get("baseToken") or {}
-                name = base_token.get("name", name)
-                symbol = base_token.get("symbol", symbol)
-                market_cap = pair.get("marketCap", 0) or pair.get("fdv", 0) or 0
-                liquidity = pair.get("liquidity") or {}
-                liquidity_usd = liquidity.get("usd", 0)
-                dex_name = pair.get("dexId", dex_name)
-                pair_url_link = pair.get("url", pair_url_link)
-
-            if not pair:
+            if not pair or pair.get("dexId") not in DEX_MIGRES:
+                # Pas encore de pool, ou encore sur pump.fun (bonding curve) :
+                # on met en attente de migration.
+                pending_mints[mint] = time.time()
                 continue
 
-            if pair.get("dexId") not in DEX_MIGRES:
-                print(f"[non migré] {symbol} ({mint}) — dex={pair.get('dexId')}")
-                continue
-
-            if not passe_les_filtres(market_cap, liquidity_usd):
-                print(f"[filtré] {symbol} ({mint}) — MC=${market_cap:,.0f} Liq=${liquidity_usd:,.0f}")
-                continue
-
-            rug_ok, rug_score, rug_flags = rugcheck_verdict(mint)
-            if not rug_ok:
-                print(f"[rugcheck] {symbol} ({mint}) rejeté — score={rug_score} flags={rug_flags}")
-                continue
-
-            flags_txt = ", ".join(rug_flags) if rug_flags else "Aucun"
-            msg_ok = (
-                f"✅ *Nouveau Token Solana Détecté !*\n\n"
-                f"🪙 Nom : {name} ({symbol})\n"
-                f"🏦 DEX : {dex_name}\n"
-                f"📊 Market Cap / FDV : ${market_cap:,.0f}\n"
-                f"💧 Liquidité USD : ${liquidity_usd:,.0f}\n"
-                f"🛡️ RugCheck Score : {rug_score}/100\n"
-                f"🚩 Flags : {flags_txt}\n"
-                f"🔗 [Voir sur DexScreener]({pair_url_link})\n"
-                f"🔍 [Voir sur RugCheck](https://rugcheck.xyz/tokens/{mint})"
-            )
-            send_telegram_message(msg_ok)
-            print(f"Alerte envoyée pour : {symbol} ({mint}) — RugCheck score={rug_score}")
-
-            active_tokens[mint] = {
-                "symbol": symbol,
-                "initial_mc": market_cap or 1.0,
-                "max_price": market_cap or 1.0,
-                "start_time": time.time(),
-            }
+            # Déjà migré au moment où on le découvre : 1er point de donnée
+            # disponible, on l'utilise comme market cap initial.
+            essayer_alerter(mint, pair, source_url)
 
     except Exception as e:
         print(f"Erreur lors de la vérification DexScreener : {e}")
+
+
+def check_pending_tokens():
+    """
+    Reprend chaque mint en attente et vérifie si son pool est passé sur
+    Raydium/PumpSwap depuis le dernier passage. Tourne à chaque boucle
+    (~10s), donc on capture le market cap au tout premier cycle où la
+    migration devient visible : c'est ça, le vrai "market cap initial".
+    """
+    now = time.time()
+    to_remove = []
+
+    for mint, first_seen in list(pending_mints.items()):
+        if now - first_seen > PENDING_MAX_AGE:
+            to_remove.append(mint)
+            continue
+
+        pair = fetch_pair_data(mint)
+        if not pair or pair.get("dexId") not in DEX_MIGRES:
+            continue  # toujours pas migré, on réessaiera au prochain cycle
+
+        essayer_alerter(mint, pair, f"https://dexscreener.com/solana/{mint}")
+        # Migré ou non retenu (filtres/rugcheck), inutile de le re-tester :
+        # un pool ne "migre" qu'une fois.
+        to_remove.append(mint)
+
+    for mint in to_remove:
+        pending_mints.pop(mint, None)
 
 
 PRICE_CHECK_INTERVAL = 120  # ne va chercher le prix que toutes les 2 minutes
@@ -226,13 +289,15 @@ def monitor_ath():
             initial_mc = data["initial_mc"] or 1.0
             max_mc = active_tokens[mint]["max_price"]
             multiplicateur = max_mc / initial_mc
+            dex_url = data.get("dex_url", f"https://dexscreener.com/solana/{mint}")
 
             msg_rapport = (
                 f"📋 *Rapport 30 min*\n\n"
                 f"🪙 Token : {data['symbol']}\n"
-                f"💰 Market Cap initial : ${initial_mc:,.0f}\n"
+                f"💰 Market Cap initial (à la migration) : ${initial_mc:,.0f}\n"
                 f"🏆 Market Cap max atteint : ${max_mc:,.0f}\n"
-                f"✖️ Multiplicateur : x{multiplicateur:,.2f}"
+                f"✖️ Multiplicateur : x{multiplicateur:,.2f}\n"
+                f"🔗 [Voir sur DexScreener]({dex_url})"
             )
             send_telegram_message(msg_rapport)
             print(f"Rapport 30 min envoyé pour : {data['symbol']} — x{multiplicateur:,.2f}")
@@ -246,5 +311,6 @@ if __name__ == "__main__":
     print("Bot de surveillance démarré...")
     while True:
         check_new_solana_tokens()
+        check_pending_tokens()
         monitor_ath()
         time.sleep(10)
