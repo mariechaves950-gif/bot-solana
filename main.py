@@ -156,6 +156,7 @@ def essayer_alerter(mint, pair, source_url):
         f"🛡️ RugCheck Score : {rug_score}/100\n"
         f"🚩 Flags : {flags_txt}\n"
         f"🔗 [Voir sur DexScreener]({pair_url_link})\n"
+        f"⚡ [Trader sur Axiom](https://axiom.trade/meme/{mint})\n"
         f"🔍 [Voir sur RugCheck](https://rugcheck.xyz/tokens/{mint})"
     )
     send_telegram_message(msg_ok)
@@ -220,14 +221,31 @@ def check_new_solana_tokens():
         print(f"Erreur lors de la vérification DexScreener : {e}")
 
 
+# Un mint en attente est re-testé au maximum toutes les PENDING_CHECK_INTERVAL
+# secondes (et non à chaque boucle de 10s) pour éviter de saturer l'API
+# DexScreener si beaucoup de mints sont en attente de migration en même temps.
+# 10s reste la meilleure précision possible sur le moment de la migration ;
+# on augmente cet intervalle seulement si le nombre de pending_mints devient
+# trop grand pour l'API.
+PENDING_CHECK_INTERVAL = 30
+_last_pending_check = 0
+
+
 def check_pending_tokens():
     """
     Reprend chaque mint en attente et vérifie si son pool est passé sur
-    Raydium/PumpSwap depuis le dernier passage. Tourne à chaque boucle
-    (~10s), donc on capture le market cap au tout premier cycle où la
-    migration devient visible : c'est ça, le vrai "market cap initial".
+    Raydium/PumpSwap depuis le dernier passage. Ne s'exécute réellement que
+    toutes les PENDING_CHECK_INTERVAL secondes (throttling), donc on capture
+    le market cap au premier cycle de vérification où la migration devient
+    visible : c'est ça, le vrai "market cap initial".
     """
+    global _last_pending_check
     now = time.time()
+
+    if (now - _last_pending_check) < PENDING_CHECK_INTERVAL:
+        return
+    _last_pending_check = now
+
     to_remove = []
 
     for mint, first_seen in list(pending_mints.items()):
@@ -297,7 +315,8 @@ def monitor_ath():
                 f"💰 Market Cap initial (à la migration) : ${initial_mc:,.0f}\n"
                 f"🏆 Market Cap max atteint : ${max_mc:,.0f}\n"
                 f"✖️ Multiplicateur : x{multiplicateur:,.2f}\n"
-                f"🔗 [Voir sur DexScreener]({dex_url})"
+                f"🔗 [Voir sur DexScreener]({dex_url})\n"
+                f"⚡ [Trader sur Axiom](https://axiom.trade/meme/{mint})"
             )
             send_telegram_message(msg_rapport)
             print(f"Rapport 30 min envoyé pour : {data['symbol']} — x{multiplicateur:,.2f}")
