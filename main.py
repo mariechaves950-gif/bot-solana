@@ -1,4 +1,5 @@
 import os
+import csv
 import time
 import requests
 
@@ -31,6 +32,47 @@ MIN_LIQUIDITY_RATIO = 0.03    # liquidité doit représenter au moins 3% du mark
 # gradué. Une fois la bonding curve terminée (migration), il apparaît sur
 # PumpSwap ou Raydium. On ne veut alerter QUE sur les tokens déjà migrés.
 DEX_MIGRES = {"pumpswap", "raydium"}
+
+# --- LOG POUR ANALYSE STATISTIQUE ---
+# Chaque token, une fois son suivi de 30 min terminé, est ajouté comme une
+# ligne dans ce CSV : toutes les données qu'on avait AU MOMENT DE L'ALERTE
+# (donc disponibles à l'avance) + le résultat final (multiplicateur). Ça
+# permet de comparer après coup ce qui différencie les tokens qui font x2+
+# de ceux qui ne font rien.
+# Attention : sur Railway, le système de fichiers est éphémère lors d'un
+# redéploiement. Pour un historique qui survit aux redéploiements, il
+# faudrait plutôt écrire vers un Google Sheet, une base externe (ex.
+# Supabase/Postgres), ou un volume persistant Railway.
+LOG_FILE = "token_log.csv"
+LOG_FIELDS = [
+    "timestamp", "mint", "symbol", "dex",
+    "initial_mc", "max_mc", "multiplicateur",
+    "liquidity_usd", "liquidity_ratio",
+    "rugcheck_score", "rugcheck_flags",
+    "txns_buys_m5", "txns_sells_m5", "volume_m5",
+    "txns_buys_h1", "txns_sells_h1", "volume_h1",
+]
+
+
+def log_resultat_csv(row):
+    """Ajoute une ligne au CSV de log, en créant l'en-tête si besoin."""
+    try:
+        file_existe = os.path.isfile(LOG_FILE)
+        with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=LOG_FIELDS)
+            if not file_existe:
+                writer.writeheader()
+            writer.writerow(row)
+    except Exception as e:
+        print(f"[log_resultat_csv] erreur : {e}")
+
+
+def _to_float(value):
+    """Conversion défensive en float (le priceUsd de DexScreener est une string)."""
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def passe_les_filtres(market_cap, liquidity_usd):
@@ -78,6 +120,50 @@ def rugcheck_verdict(mint):
     except Exception as e:
         print(f"[rugcheck] erreur pour {mint} : {e}")
         return False, None, []
+
+
+def get_true_ath_mc(pool_address, initial_mc, initial_price, start_time):
+    """
+    Récupère les vraies bougies OHLCV via GeckoTerminal (API publique,
+    gratuite, sans clé) pour calculer le véritable plus haut (ATH) atteint
+    depuis la migration — sans avoir besoin de sonder l'API toutes les X
+    secondes. Le "high" de chaque bougie capture les pics même s'ils ne
+    durent que quelques secondes entre deux vérifications classiques.
+
+    Retourne le market cap ATH estimé (converti à partir du ratio de prix),
+    ou None si l'appel échoue ou si on n'a pas de prix initial pour convertir
+    — dans ce cas, on retombe sur le suivi par polling classique.
+    """
+    if not pool_address or not initial_price:
+        return None
+    try:
+        elapsed_minutes = max(int((time.time() - start_time) / 60) + 5, 10)
+        url = f"https://api.geckoterminal.com/api/v2/networks/solana/pools/{pool_address}/ohlcv/minute"
+        params = {
+            "aggregate": 1,
+            "limit": min(elapsed_minutes, 1000),
+            "currency": "usd",
+            "token": "base",
+        }
+        res = requests.get(url, params=params, timeout=8)
+        if res.status_code != 200:
+            print(f"[geckoterminal] status={res.status_code} pour {pool_address}")
+            return None
+
+        ohlcv_list = res.json().get("data", {}).get("attributes", {}).get("ohlcv_list", [])
+        if not ohlcv_list:
+            return None
+
+        # Chaque bougie : [timestamp, open, high, low, close, volume]
+        max_high = max(candle[2] for candle in ohlcv_list if len(candle) >= 3)
+        if not max_high:
+            return None
+
+        return initial_mc * (max_high / initial_price)
+
+    except Exception as e:
+        print(f"[geckoterminal] erreur pour {pool_address} : {e}")
+        return None
 
 
 def send_telegram_message(message):
@@ -146,6 +232,22 @@ def essayer_alerter(mint, pair, source_url):
         print(f"[rugcheck] {symbol} ({mint}) rejeté — score={rug_score} flags={rug_flags}")
         return False
 
+    # Données supplémentaires, non utilisées comme filtre, juste pour le log
+    # et la comparaison a posteriori (voir LOG_FIELDS).
+    txns = pair.get("txns") or {}
+    volume = pair.get("volume") or {}
+    txns_m5 = txns.get("m5") or {}
+    txns_h1 = txns.get("h1") or {}
+    entry_stats = {
+        "liquidity_ratio": round(liquidity_usd / market_cap, 4) if market_cap else None,
+        "txns_buys_m5": txns_m5.get("buys"),
+        "txns_sells_m5": txns_m5.get("sells"),
+        "volume_m5": volume.get("m5"),
+        "txns_buys_h1": txns_h1.get("buys"),
+        "txns_sells_h1": txns_h1.get("sells"),
+        "volume_h1": volume.get("h1"),
+    }
+
     flags_txt = ", ".join(rug_flags) if rug_flags else "Aucun"
     msg_ok = (
         f"✅ *Nouveau Token Solana Détecté !*\n\n"
@@ -164,10 +266,17 @@ def essayer_alerter(mint, pair, source_url):
 
     active_tokens[mint] = {
         "symbol": symbol,
+        "dex": dex_name,
         "initial_mc": market_cap or 1.0,
         "max_price": market_cap or 1.0,
+        "liquidity_usd": liquidity_usd,
+        "rugcheck_score": rug_score,
+        "rugcheck_flags": flags_txt,
         "start_time": time.time(),
         "dex_url": pair_url_link,  # <-- pour le lien dans le rapport 30 min
+        "entry_stats": entry_stats,  # <-- pour le log CSV à la fin du suivi
+        "pool_address": pair.get("pairAddress"),  # <-- pour interroger GeckoTerminal
+        "initial_price": _to_float(pair.get("priceUsd")),
     }
     seen_mints.add(mint)
     return True
@@ -320,6 +429,28 @@ def monitor_ath():
             )
             send_telegram_message(msg_rapport)
             print(f"Rapport 30 min envoyé pour : {data['symbol']} — x{multiplicateur:,.2f}")
+
+            entry_stats = data.get("entry_stats", {})
+            log_resultat_csv({
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "mint": mint,
+                "symbol": data["symbol"],
+                "dex": data.get("dex"),
+                "initial_mc": initial_mc,
+                "max_mc": max_mc,
+                "multiplicateur": round(multiplicateur, 3),
+                "liquidity_usd": data.get("liquidity_usd"),
+                "liquidity_ratio": entry_stats.get("liquidity_ratio"),
+                "rugcheck_score": data.get("rugcheck_score"),
+                "rugcheck_flags": data.get("rugcheck_flags"),
+                "txns_buys_m5": entry_stats.get("txns_buys_m5"),
+                "txns_sells_m5": entry_stats.get("txns_sells_m5"),
+                "volume_m5": entry_stats.get("volume_m5"),
+                "txns_buys_h1": entry_stats.get("txns_buys_h1"),
+                "txns_sells_h1": entry_stats.get("txns_sells_h1"),
+                "volume_h1": entry_stats.get("volume_h1"),
+            })
+
             tokens_to_remove.append(mint)
 
     for mint in tokens_to_remove:
