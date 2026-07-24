@@ -1,6 +1,7 @@
 import os
 import csv
 import time
+import threading
 import requests
 
 # --- CONFIGURATION ---
@@ -33,6 +34,15 @@ MIN_LIQUIDITY_RATIO = 0.03    # liquidité doit représenter au moins 3% du mark
 # PumpSwap ou Raydium. On ne veut alerter QUE sur les tokens déjà migrés.
 DEX_MIGRES = {"pumpswap", "raydium"}
 
+# --- ANALYSE DES 20 PREMIÈRES SECONDES ---
+# Juste après l'alerte, on sonde le prix à haute fréquence (toutes les
+# ANALYSE_20S_SAMPLE_INTERVAL secondes) pendant ANALYSE_20S_DURATION
+# secondes, pour savoir à quelle seconde précise le token atteint son
+# premier pic. Tourne dans un thread séparé pour ne jamais bloquer la
+# boucle principale (qui, elle, ne tourne que toutes les 10s).
+ANALYSE_20S_SAMPLE_INTERVAL = 2   # secondes entre 2 mesures
+ANALYSE_20S_DURATION = 20         # durée totale observée
+
 # --- LOG POUR ANALYSE STATISTIQUE ---
 # Chaque token, une fois son suivi de 30 min terminé, est ajouté comme une
 # ligne dans ce CSV : toutes les données qu'on avait AU MOMENT DE L'ALERTE
@@ -51,6 +61,7 @@ LOG_FIELDS = [
     "rugcheck_score", "rugcheck_flags",
     "txns_buys_m5", "txns_sells_m5", "volume_m5",
     "txns_buys_h1", "txns_sells_h1", "volume_h1",
+    "peak_second_20s", "peak_mult_20s",
 ]
 
 
@@ -182,6 +193,72 @@ def send_telegram_message(message):
         print(f"Erreur d'envoi Telegram : {e}")
 
 
+def send_telegram_document(filepath, caption=None):
+    """
+    Envoie un fichier en pièce jointe Telegram (utilisé pour le CSV de log).
+    Si le fichier n'existe pas encore (aucun token n'a terminé son suivi
+    de 30 min), on prévient l'utilisateur au lieu de planter.
+    """
+    if not os.path.isfile(filepath):
+        send_telegram_message(f"⚠️ Aucun fichier `{filepath}` pour le moment (aucun token n'a encore terminé son suivi de 30 min).")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
+    try:
+        with open(filepath, "rb") as f:
+            files = {"document": (os.path.basename(filepath), f)}
+            payload = {"chat_id": CHAT_ID}
+            if caption:
+                payload["caption"] = caption
+            r = requests.post(url, data=payload, files=files, timeout=30)
+            if r.status_code != 200:
+                print(f"Erreur envoi document Telegram ({r.status_code}) : {r.text}")
+    except Exception as e:
+        print(f"Erreur d'envoi du document Telegram : {e}")
+
+
+_telegram_update_offset = 0
+
+
+def check_telegram_commands():
+    """
+    Vérifie les nouveaux messages reçus par le bot (getUpdates) et répond
+    aux commandes reconnues. Appelée à chaque tour de la boucle principale
+    (~toutes les 10s), donc une commande peut mettre jusqu'à ~10s à être
+    traitée. On ignore tout message qui ne vient pas du CHAT_ID autorisé.
+
+    Commandes reconnues : /csv, /log, /download -> envoie le CSV complet.
+    """
+    global _telegram_update_offset
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    params = {"offset": _telegram_update_offset + 1, "timeout": 0}
+    try:
+        res = requests.get(url, params=params, timeout=10)
+        if res.status_code != 200:
+            print(f"[check_telegram_commands] status={res.status_code}")
+            return
+        updates = res.json().get("result", [])
+    except Exception as e:
+        print(f"[check_telegram_commands] erreur : {e}")
+        return
+
+    for update in updates:
+        _telegram_update_offset = max(_telegram_update_offset, update.get("update_id", 0))
+        message = update.get("message") or {}
+        chat_id = str((message.get("chat") or {}).get("id", ""))
+        text = (message.get("text") or "").strip().lower()
+
+        if chat_id != str(CHAT_ID):
+            continue
+
+        if text in ("/csv", "/log", "/download"):
+            send_telegram_document(LOG_FILE, caption="📊 Historique complet des tokens suivis")
+        elif text == "/help":
+            send_telegram_message(
+                "Commandes disponibles :\n"
+                "/csv — télécharger le fichier de log complet"
+            )
+
+
 def fetch_pair_data(mint):
     """Récupère la 1ère pair DexScreener connue pour un mint, ou None."""
     try:
@@ -194,6 +271,58 @@ def fetch_pair_data(mint):
     except Exception as e:
         print(f"[fetch_pair_data] erreur pour {mint} : {e}")
         return None
+
+
+def analyser_20_premieres_secondes(mint):
+    """
+    Tourne dans un THREAD SÉPARÉ, lancé juste après l'alerte d'un token.
+    Sonde le market cap toutes les ANALYSE_20S_SAMPLE_INTERVAL secondes
+    pendant ANALYSE_20S_DURATION secondes pour déterminer à quelle seconde
+    précise (depuis l'alerte) le token a atteint son premier pic.
+
+    Le résultat est stocké dans active_tokens[mint] (peak_second_20s /
+    peak_mult_20s) pour être repris dans le rapport CSV final, et un
+    message Telegram récapitulatif est envoyé immédiatement.
+    """
+    data = active_tokens.get(mint)
+    if not data:
+        return
+    initial_mc = data.get("initial_mc") or 1.0
+    start = data["start_time"]
+    samples = []  # liste de (seconde_ecoulee, market_cap)
+
+    nb_mesures = max(int(ANALYSE_20S_DURATION / ANALYSE_20S_SAMPLE_INTERVAL), 1)
+    for i in range(nb_mesures + 1):
+        elapsed = round(time.time() - start)
+        pair = fetch_pair_data(mint)
+        mc = None
+        if pair:
+            mc = pair.get("marketCap", 0) or pair.get("fdv", 0)
+        samples.append((elapsed, mc))
+        if i < nb_mesures:
+            time.sleep(ANALYSE_20S_SAMPLE_INTERVAL)
+
+    valides = [(s, mc) for s, mc in samples if mc]
+    if not valides:
+        print(f"[analyse_20s] aucune donnée exploitable pour {mint}")
+        return
+
+    peak_second, peak_mc = max(valides, key=lambda x: x[1])
+    peak_mult = peak_mc / initial_mc
+
+    if mint in active_tokens:
+        active_tokens[mint]["peak_second_20s"] = peak_second
+        active_tokens[mint]["peak_mult_20s"] = round(peak_mult, 3)
+
+    msg = (
+        f"⏱️ *Analyse des 20 premières secondes*\n\n"
+        f"🪙 Token : {data['symbol']}\n"
+        f"📈 Pic atteint à la seconde : {peak_second}s\n"
+        f"💰 Market Cap au pic : ${peak_mc:,.0f}\n"
+        f"✖️ Multiplicateur au pic (20s) : x{peak_mult:,.2f}"
+    )
+    send_telegram_message(msg)
+    print(f"[analyse_20s] {data['symbol']} ({mint}) — pic à {peak_second}s, x{peak_mult:,.2f}")
 
 
 def essayer_alerter(mint, pair, source_url):
@@ -279,6 +408,12 @@ def essayer_alerter(mint, pair, source_url):
         "initial_price": _to_float(pair.get("priceUsd")),
     }
     seen_mints.add(mint)
+
+    # Lance l'analyse des 20 premières secondes dans un thread séparé pour
+    # ne pas bloquer la boucle principale (qui doit continuer à tourner
+    # toutes les 10s pendant ce temps-là).
+    threading.Thread(target=analyser_20_premieres_secondes, args=(mint,), daemon=True).start()
+
     return True
 
 
@@ -467,6 +602,8 @@ def monitor_ath():
                 "txns_buys_h1": entry_stats.get("txns_buys_h1"),
                 "txns_sells_h1": entry_stats.get("txns_sells_h1"),
                 "volume_h1": entry_stats.get("volume_h1"),
+                "peak_second_20s": data.get("peak_second_20s"),
+                "peak_mult_20s": data.get("peak_mult_20s"),
             })
 
             tokens_to_remove.append(mint)
@@ -478,6 +615,7 @@ def monitor_ath():
 if __name__ == "__main__":
     print("Bot de surveillance démarré...")
     while True:
+        check_telegram_commands()
         check_new_solana_tokens()
         check_pending_tokens()
         monitor_ath()
