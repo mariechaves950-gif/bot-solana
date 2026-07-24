@@ -407,14 +407,32 @@ def monitor_ath():
                     pairs = token_data.get("pairs") if token_data else None
                     if pairs and pairs[0]:
                         current_mc = pairs[0].get("marketCap", 0) or pairs[0].get("fdv", 0)
+                        print(f"[monitor_ath] {data['symbol']} ({mint}) MC actuel=${current_mc:,.0f} (max enregistré=${data['max_price']:,.0f})")
                         if current_mc and current_mc > data["max_price"]:
                             active_tokens[mint]["max_price"] = current_mc
+                    else:
+                        print(f"[monitor_ath] {data['symbol']} ({mint}) aucune pair retournée par DexScreener")
+                else:
+                    print(f"[monitor_ath] {data['symbol']} ({mint}) status={res.status_code} — {res.text[:200]}")
             except Exception as e:
                 print(f"Erreur monitor_ath pour {mint} : {e}")
 
         if elapsed >= 1800:
             initial_mc = data["initial_mc"] or 1.0
-            max_mc = active_tokens[mint]["max_price"]
+
+            # Vrai ATH via les bougies OHLCV GeckoTerminal (capture les pics
+            # même s'ils sont passés entre deux polling classiques). On garde
+            # le max avec le suivi par polling, au cas où GeckoTerminal
+            # échoue ou ne connaît pas encore ce pool.
+            true_ath_mc = get_true_ath_mc(
+                data.get("pool_address"),
+                initial_mc,
+                data.get("initial_price"),
+                data["start_time"],
+            )
+            print(f"[monitor_ath] {data['symbol']} ({mint}) GeckoTerminal ATH mc={true_ath_mc}")
+            max_mc = max(active_tokens[mint]["max_price"], true_ath_mc or 0)
+
             multiplicateur = max_mc / initial_mc
             dex_url = data.get("dex_url", f"https://dexscreener.com/solana/{mint}")
 
