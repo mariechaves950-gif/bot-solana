@@ -264,7 +264,7 @@ def get_pump_fun_creator(mint):
     d'échec, plutôt que de faire planter le reste du pipeline.
     """
     try:
-        url = f"https://frontend-api.pump.fun/coins/{mint}"
+        url = f"https://frontend-api-v3.pump.fun/coins-v2/{mint}"
         res = requests.get(url, timeout=8, headers={"Accept": "application/json"})
         if res.status_code != 200:
             print(f"[pump_fun_creator] status={res.status_code} pour {mint}")
