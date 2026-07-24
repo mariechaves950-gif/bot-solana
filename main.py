@@ -70,15 +70,14 @@ ANALYSE_20S_DURATION = 20         # durée totale observée
 # Supabase/Postgres), ou un volume persistant Railway.
 LOG_FILE = "token_log.csv"
 LOG_FIELDS = [
-    "timestamp", "mint", "symbol", "dex",
-    "initial_mc", "max_mc", "multiplicateur",
-    "liquidity_usd", "liquidity_ratio",
-    "rugcheck_score", "rugcheck_flags",
-    "top10_pct", "insiders_detected",
-    "txns_buys_m5", "txns_sells_m5", "volume_m5",
-    "txns_buys_h1", "txns_sells_h1", "volume_h1",
-    "peak_second_20s", "peak_mult_20s",
-    "low_second_20s", "low_mult_20s",
+    "horodatage", "mint", "symbole", "dex",
+    "mc_initial", "mc_max", "multiplicateur",
+    "liquidite_usd", "ratio_liquidite",
+    "score_rugcheck", "alertes_rugcheck",
+    "pct_top10_holders", "insiders_detectes",
+    "achats_m5", "ventes_m5", "volume_m5",
+    "achats_h1", "ventes_h1", "volume_h1",
+    "seconde_prix_plus_bas_20s", "multiplicateur_plus_bas_20s",
 ]
 
 
@@ -328,11 +327,12 @@ def analyser_20_premieres_secondes(mint):
     Tourne dans un THREAD SÉPARÉ, lancé juste après l'alerte d'un token.
     Sonde le market cap toutes les ANALYSE_20S_SAMPLE_INTERVAL secondes
     pendant ANALYSE_20S_DURATION secondes pour déterminer à quelle seconde
-    précise (depuis l'alerte) le token a atteint son premier pic.
+    précise (depuis l'alerte) le token a atteint son point le plus bas
+    (utile pour savoir statistiquement à quel moment il vaut mieux entrer).
 
-    Le résultat est stocké dans active_tokens[mint] (peak_second_20s /
-    peak_mult_20s) pour être repris dans le rapport CSV final, et un
-    message Telegram récapitulatif est envoyé immédiatement.
+    Le résultat est stocké dans active_tokens[mint] (low_second_20s /
+    low_mult_20s) pour être repris dans le rapport CSV final. Aucun message
+    Telegram n'est envoyé ici : le résultat n'apparaît que dans le CSV.
     """
     data = active_tokens.get(mint)
     if not data:
@@ -357,33 +357,18 @@ def analyser_20_premieres_secondes(mint):
         print(f"[analyse_20s] aucune donnée exploitable pour {mint}")
         return
 
-    peak_second, peak_mc = max(valides, key=lambda x: x[1])
-    peak_mult = peak_mc / initial_mc
-
     # Point le plus BAS atteint sur la fenêtre (le "creux" des 20 premières
     # secondes) — utile pour savoir si le token dump avant de repartir, et
-    # à quel moment précis ça arrive (ex: pour estimer un stop-loss réaliste).
+    # à quel moment précis ça arrive (ex: pour estimer un point d'entrée
+    # réaliste).
     low_second, low_mc = min(valides, key=lambda x: x[1])
     low_mult = low_mc / initial_mc
 
     if mint in active_tokens:
-        active_tokens[mint]["peak_second_20s"] = peak_second
-        active_tokens[mint]["peak_mult_20s"] = round(peak_mult, 3)
         active_tokens[mint]["low_second_20s"] = low_second
         active_tokens[mint]["low_mult_20s"] = round(low_mult, 3)
 
-    msg = (
-        f"⏱️ *Analyse des 20 premières secondes*\n\n"
-        f"🪙 Token : {data['symbol']}\n"
-        f"📈 Pic atteint à la seconde : {peak_second}s\n"
-        f"💰 Market Cap au pic : ${peak_mc:,.0f}\n"
-        f"✖️ Multiplicateur au pic (20s) : x{peak_mult:,.2f}\n\n"
-        f"📉 Point le plus bas atteint à la seconde : {low_second}s\n"
-        f"💰 Market Cap au plus bas : ${low_mc:,.0f}\n"
-        f"✖️ Multiplicateur au plus bas (20s) : x{low_mult:,.2f}"
-    )
-    send_telegram_message(msg)
-    print(f"[analyse_20s] {data['symbol']} ({mint}) — pic à {peak_second}s (x{peak_mult:,.2f}), plus bas à {low_second}s (x{low_mult:,.2f})")
+    print(f"[analyse_20s] {data['symbol']} ({mint}) — point le plus bas à {low_second}s (x{low_mult:,.2f})")
 
 
 def essayer_alerter(mint, pair, source_url):
@@ -652,29 +637,27 @@ def monitor_ath():
 
             entry_stats = data.get("entry_stats", {})
             log_resultat_csv({
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "horodatage": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "mint": mint,
-                "symbol": data["symbol"],
+                "symbole": data["symbol"],
                 "dex": data.get("dex"),
-                "initial_mc": initial_mc,
-                "max_mc": max_mc,
+                "mc_initial": initial_mc,
+                "mc_max": max_mc,
                 "multiplicateur": round(multiplicateur, 3),
-                "liquidity_usd": data.get("liquidity_usd"),
-                "liquidity_ratio": entry_stats.get("liquidity_ratio"),
-                "rugcheck_score": data.get("rugcheck_score"),
-                "rugcheck_flags": data.get("rugcheck_flags"),
-                "top10_pct": data.get("top10_pct"),
-                "insiders_detected": data.get("insiders_detected"),
-                "txns_buys_m5": entry_stats.get("txns_buys_m5"),
-                "txns_sells_m5": entry_stats.get("txns_sells_m5"),
+                "liquidite_usd": data.get("liquidity_usd"),
+                "ratio_liquidite": entry_stats.get("liquidity_ratio"),
+                "score_rugcheck": data.get("rugcheck_score"),
+                "alertes_rugcheck": data.get("rugcheck_flags"),
+                "pct_top10_holders": data.get("top10_pct"),
+                "insiders_detectes": data.get("insiders_detected"),
+                "achats_m5": entry_stats.get("txns_buys_m5"),
+                "ventes_m5": entry_stats.get("txns_sells_m5"),
                 "volume_m5": entry_stats.get("volume_m5"),
-                "txns_buys_h1": entry_stats.get("txns_buys_h1"),
-                "txns_sells_h1": entry_stats.get("txns_sells_h1"),
+                "achats_h1": entry_stats.get("txns_buys_h1"),
+                "ventes_h1": entry_stats.get("txns_sells_h1"),
                 "volume_h1": entry_stats.get("volume_h1"),
-                "peak_second_20s": data.get("peak_second_20s"),
-                "peak_mult_20s": data.get("peak_mult_20s"),
-                "low_second_20s": data.get("low_second_20s"),
-                "low_mult_20s": data.get("low_mult_20s"),
+                "seconde_prix_plus_bas_20s": data.get("low_second_20s"),
+                "multiplicateur_plus_bas_20s": data.get("low_mult_20s"),
             })
 
             tokens_to_remove.append(mint)
