@@ -150,11 +150,40 @@ def _extraire_concentration_holders(data):
     return top10_pct, insiders_detected
 
 
+def _extraire_holders_et_bundle(data):
+    """
+    Extrait le nombre total de holders et détecte un éventuel "bundle"
+    (achats groupés au lancement, signature de bots coordonnés / insiders),
+    toujours depuis la même réponse RugCheck déjà reçue.
+
+    ATTENTION : la doc publique de l'endpoint report/summary ne précise pas
+    formellement le nom du champ "nombre de holders" ni un champ dédié
+    "bundle" — on tente donc plusieurs clés plausibles, et on détecte le
+    bundle par mot-clé dans "risks" (RugCheck y ajoute généralement une
+    entrée explicite quand un bundle est détecté). Si total_holders reste
+    systématiquement None une fois en prod, inspecte une réponse brute
+    (print(data)) pour repérer le bon nom de champ et ajuste la liste
+    ci-dessous.
+    """
+    total_holders = data.get("totalHolders")
+    if total_holders is None:
+        total_holders = data.get("holders")
+    if total_holders is None:
+        holder_analysis = data.get("holderAnalysis") or {}
+        total_holders = holder_analysis.get("totalHolders") or holder_analysis.get("count")
+
+    risks = data.get("risks") or []
+    bundle_detected = any("bundle" in (r.get("name", "") or "").lower() for r in risks)
+
+    return total_holders, bundle_detected
+
+
 def rugcheck_verdict(mint):
     """
     Interroge RugCheck.xyz (API publique, sans clé) pour un score de risque.
     Retourne (ok: bool, score: int|None, flags: list[str], top10_pct: float|None,
-    insiders_detected: int, lp_locked_pct: float|None).
+    insiders_detected: int, lp_locked_pct: float|None, total_holders: int|None,
+    bundle_detected: bool).
     En cas d'erreur ou de timeout, on considère le token comme "non vérifiable"
     et on ne l'envoie pas (mieux vaut rater une alerte qu'en envoyer une dangereuse).
     """
@@ -163,7 +192,7 @@ def rugcheck_verdict(mint):
         res = requests.get(url, timeout=8)
         if res.status_code != 200:
             print(f"[rugcheck] status={res.status_code} pour {mint}")
-            return False, None, [], None, 0, None
+            return False, None, [], None, 0, None, None, False
 
         data = res.json()
         score = data.get("score_normalised")
@@ -172,9 +201,10 @@ def rugcheck_verdict(mint):
         lp_locked = data.get("lpLockedPct", 0)
 
         top10_pct, insiders_detected = _extraire_concentration_holders(data)
+        total_holders, bundle_detected = _extraire_holders_et_bundle(data)
 
         if score is None:
-            return False, None, flags, top10_pct, insiders_detected, lp_locked
+            return False, None, flags, top10_pct, insiders_detected, lp_locked, total_holders, bundle_detected
 
         ok = score <= RUGCHECK_MAX_SCORE and lp_locked and lp_locked > 0
 
@@ -186,11 +216,11 @@ def rugcheck_verdict(mint):
             print(f"[rugcheck] {mint} rejeté — {insiders_detected} alerte(s) de concentration/insiders")
             ok = False
 
-        return ok, score, flags, top10_pct, insiders_detected, lp_locked
+        return ok, score, flags, top10_pct, insiders_detected, lp_locked, total_holders, bundle_detected
 
     except Exception as e:
         print(f"[rugcheck] erreur pour {mint} : {e}")
-        return False, None, [], None, 0, None
+        return False, None, [], None, 0, None, None, False
 
 
 def get_true_ath_mc(pool_address, initial_mc, initial_price, start_time):
@@ -462,7 +492,7 @@ def essayer_alerter(mint, pair, source_url):
         print(f"[filtré] {symbol} ({mint}) — MC=${market_cap:,.0f} Liq=${liquidity_usd:,.0f}")
         return False
 
-    rug_ok, rug_score, rug_flags, top10_pct, insiders_detected, lp_locked_pct = rugcheck_verdict(mint)
+    rug_ok, rug_score, rug_flags, top10_pct, insiders_detected, lp_locked_pct, total_holders, bundle_detected = rugcheck_verdict(mint)
     if not rug_ok:
         print(f"[rugcheck] {symbol} ({mint}) rejeté — score={rug_score} flags={rug_flags} top10={top10_pct}")
         return False
@@ -496,6 +526,8 @@ def essayer_alerter(mint, pair, source_url):
 
     flags_txt = ", ".join(rug_flags) if rug_flags else "Aucun"
     top10_txt = f"{top10_pct}%" if top10_pct is not None else "N/A"
+    holders_txt = f"{total_holders}" if total_holders is not None else "N/A"
+    bundle_txt = "⚠️ Oui" if bundle_detected else "Non"
     msg_ok = (
         f"✅ *Nouveau Token Solana Détecté !*\n\n"
         f"🪙 Nom : {name} ({symbol})\n"
@@ -505,6 +537,8 @@ def essayer_alerter(mint, pair, source_url):
         f"🛡️ RugCheck Score : {rug_score}/100\n"
         f"🚩 Flags : {flags_txt}\n"
         f"👥 Top 10 holders : {top10_txt}\n"
+        f"👤 Nombre de holders : {holders_txt}\n"
+        f"📦 Bundle détecté : {bundle_txt}\n"
         f"🕵️ Insiders détectés : {insiders_detected}\n"
         f"🔗 [Voir sur DexScreener]({pair_url_link})\n"
         f"⚡ [Trader sur Axiom](https://axiom.trade/meme/{mint})\n"
@@ -524,6 +558,8 @@ def essayer_alerter(mint, pair, source_url):
         "top10_pct": top10_pct,
         "insiders_detected": insiders_detected,
         "lp_locked_pct": lp_locked_pct,
+        "total_holders": total_holders,
+        "bundle_detected": bundle_detected,
         "pool_age_seconds": pool_age_seconds,
         "start_time": time.time(),
         "dex_url": pair_url_link,  # <-- pour le lien dans le rapport 30 min
