@@ -34,10 +34,10 @@ MIN_LIQUIDITY_RATIO = 0.03    # liquidité doit représenter au moins 3% du mark
 # PumpSwap ou Raydium. On ne veut alerter QUE sur les tokens déjà migrés.
 DEX_MIGRES = {"pumpswap", "raydium"}
 
-# --- CONCENTRATION DES HOLDERS (topHolders / insiders, via RugCheck) ---
-# RugCheck renvoie déjà topHolders + insiderReport dans le même appel que
-# le score de risque : pas besoin d'une API supplémentaire. On se contente
-# d'aller lire ces champs dans la réponse JSON déjà reçue.
+# --- CONCENTRATION DES HOLDERS (topHolders / risks, via RugCheck) ---
+# RugCheck renvoie déjà topHolders + risks dans le même appel que le score
+# de risque : pas besoin d'une API supplémentaire. On se contente d'aller
+# lire ces champs dans la réponse JSON déjà reçue.
 #
 # REJECT_TOP10_PCT : si défini (ex: 50.0), rejette automatiquement tout
 # token dont les 10 premiers wallets détiennent plus de ce % de l'offre.
@@ -45,16 +45,19 @@ DEX_MIGRES = {"pumpswap", "raydium"}
 # début, le temps de voir ce que ça donne dans le CSV).
 REJECT_TOP10_PCT = None
 
-# REJECT_IF_INSIDERS : si True, rejette tout token où RugCheck détecte des
-# wallets "insiders" liés entre eux (graphInsidersDetected > 0).
+# REJECT_IF_INSIDERS : si True, rejette tout token où RugCheck détecte au
+# moins une alerte de concentration/insiders dans sa liste "risks"
+# (single_holder, high_concentration).
 REJECT_IF_INSIDERS = False
 
 # --- ANALYSE DES 20 PREMIÈRES SECONDES ---
-# Juste après l'alerte, on sonde le prix à haute fréquence (toutes les
-# ANALYSE_20S_SAMPLE_INTERVAL secondes) pendant ANALYSE_20S_DURATION
-# secondes, pour savoir à quelle seconde précise le token atteint son
-# premier pic. Tourne dans un thread séparé pour ne jamais bloquer la
-# boucle principale (qui, elle, ne tourne que toutes les 10s).
+# Juste après l'alerte, on sonde le prix (et les txns m5) à haute fréquence
+# (toutes les ANALYSE_20S_SAMPLE_INTERVAL secondes) pendant
+# ANALYSE_20S_DURATION secondes, pour savoir à quelle seconde précise le
+# token atteint son premier creux, et pour estimer l'activité achats/ventes
+# réelle sur cette fenêtre (par delta, voir plus bas). Tourne dans un thread
+# séparé pour ne jamais bloquer la boucle principale (qui, elle, ne tourne
+# que toutes les 10s).
 ANALYSE_20S_SAMPLE_INTERVAL = 2   # secondes entre 2 mesures
 ANALYSE_20S_DURATION = 20         # durée totale observée
 
@@ -75,9 +78,11 @@ LOG_FIELDS = [
     "liquidite_usd", "ratio_liquidite",
     "score_rugcheck", "alertes_rugcheck",
     "pct_top10_holders", "insiders_detectes",
+    "pool_age_seconds", "lp_locked_pct",
     "achats_m5", "ventes_m5", "volume_m5",
     "achats_h1", "ventes_h1", "volume_h1",
     "seconde_prix_plus_bas_20s", "multiplicateur_plus_bas_20s",
+    "buy_ratio_10s", "buy_ratio_20s", "achats_bruts_2s",
 ]
 
 
@@ -120,9 +125,11 @@ RUGCHECK_MAX_SCORE = 20
 
 def _extraire_concentration_holders(data):
     """
-    Extrait la concentration des 10 premiers wallets + le nombre d'insiders
-    détectés depuis une réponse RugCheck déjà récupérée (aucun appel réseau
-    supplémentaire). Retourne (top10_pct: float|None, insiders_detected: int).
+    Extrait la concentration des 10 premiers wallets depuis "topHolders",
+    et compte le nombre d'alertes de concentration/insiders présentes dans
+    la liste "risks" de RugCheck (ex: "single_holder", "high_concentration")
+    — aucun appel réseau supplémentaire, tout vient de la réponse déjà reçue.
+    Retourne (top10_pct: float|None, insiders_detected: int).
     """
     top_holders = data.get("topHolders") or []
     top10_pct = None
@@ -133,8 +140,12 @@ def _extraire_concentration_holders(data):
         except (TypeError, ValueError):
             top10_pct = None
 
-    insider_report = data.get("insiderReport") or {}
-    insiders_detected = insider_report.get("graphInsidersDetected", 0) or 0
+    risks = data.get("risks") or []
+    concentration_keywords = ("single_holder", "high_concentration")
+    insiders_detected = sum(
+        1 for r in risks
+        if any(kw in (r.get("name", "") or "").lower() for kw in concentration_keywords)
+    )
 
     return top10_pct, insiders_detected
 
@@ -143,7 +154,7 @@ def rugcheck_verdict(mint):
     """
     Interroge RugCheck.xyz (API publique, sans clé) pour un score de risque.
     Retourne (ok: bool, score: int|None, flags: list[str], top10_pct: float|None,
-    insiders_detected: int).
+    insiders_detected: int, lp_locked_pct: float|None).
     En cas d'erreur ou de timeout, on considère le token comme "non vérifiable"
     et on ne l'envoie pas (mieux vaut rater une alerte qu'en envoyer une dangereuse).
     """
@@ -152,7 +163,7 @@ def rugcheck_verdict(mint):
         res = requests.get(url, timeout=8)
         if res.status_code != 200:
             print(f"[rugcheck] status={res.status_code} pour {mint}")
-            return False, None, [], None, 0
+            return False, None, [], None, 0, None
 
         data = res.json()
         score = data.get("score_normalised")
@@ -163,7 +174,7 @@ def rugcheck_verdict(mint):
         top10_pct, insiders_detected = _extraire_concentration_holders(data)
 
         if score is None:
-            return False, None, flags, top10_pct, insiders_detected
+            return False, None, flags, top10_pct, insiders_detected, lp_locked
 
         ok = score <= RUGCHECK_MAX_SCORE and lp_locked and lp_locked > 0
 
@@ -172,14 +183,14 @@ def rugcheck_verdict(mint):
             ok = False
 
         if ok and REJECT_IF_INSIDERS and insiders_detected > 0:
-            print(f"[rugcheck] {mint} rejeté — {insiders_detected} insiders détectés")
+            print(f"[rugcheck] {mint} rejeté — {insiders_detected} alerte(s) de concentration/insiders")
             ok = False
 
-        return ok, score, flags, top10_pct, insiders_detected
+        return ok, score, flags, top10_pct, insiders_detected, lp_locked
 
     except Exception as e:
         print(f"[rugcheck] erreur pour {mint} : {e}")
-        return False, None, [], None, 0
+        return False, None, [], None, 0, None
 
 
 def get_true_ath_mc(pool_address, initial_mc, initial_price, start_time):
@@ -325,50 +336,99 @@ def fetch_pair_data(mint):
 def analyser_20_premieres_secondes(mint):
     """
     Tourne dans un THREAD SÉPARÉ, lancé juste après l'alerte d'un token.
-    Sonde le market cap toutes les ANALYSE_20S_SAMPLE_INTERVAL secondes
-    pendant ANALYSE_20S_DURATION secondes pour déterminer à quelle seconde
-    précise (depuis l'alerte) le token a atteint son point le plus bas
-    (utile pour savoir statistiquement à quel moment il vaut mieux entrer).
+    Sonde le market cap ET les txns m5 (achats/ventes) toutes les
+    ANALYSE_20S_SAMPLE_INTERVAL secondes pendant ANALYSE_20S_DURATION
+    secondes.
 
-    Le résultat est stocké dans active_tokens[mint] (low_second_20s /
-    low_mult_20s) pour être repris dans le rapport CSV final. Aucun message
-    Telegram n'est envoyé ici : le résultat n'apparaît que dans le CSV.
+    Deux types de résultats sont calculés :
+    1) Le point le plus bas atteint (comme avant) : utile pour savoir
+       statistiquement à quel moment il vaut mieux entrer.
+    2) L'activité achats/ventes réelle sur la fenêtre, calculée PAR DELTA
+       entre deux polls consécutifs. Comme DexScreener ne fournit que des
+       compteurs sur une fenêtre glissante de 5 minutes (m5), on ne peut
+       pas connaître l'activité exacte des 20 dernières secondes
+       directement — on l'approxime en regardant de combien le compteur
+       m5 a augmenté entre deux mesures rapprochées (2s d'écart) :
+         - achats_bruts_2s : achats nets (achats - ventes) survenus entre
+           le tout premier poll (t=0s) et le second (t=2s), pour mesurer
+           combien de bots/snipers rentrent instantanément.
+         - buy_ratio_10s / buy_ratio_20s : part des achats dans le total
+           achats+ventes cumulés sur, respectivement, les 10 et 20
+           premières secondes.
+
+    Le résultat est stocké dans active_tokens[mint] pour être repris dans
+    le rapport CSV final. Aucun message Telegram n'est envoyé ici : le
+    résultat n'apparaît que dans le CSV.
     """
     data = active_tokens.get(mint)
     if not data:
         return
     initial_mc = data.get("initial_mc") or 1.0
     start = data["start_time"]
-    samples = []  # liste de (seconde_ecoulee, market_cap)
+    samples = []  # liste de (seconde_ecoulee, market_cap, achats_m5, ventes_m5)
 
     nb_mesures = max(int(ANALYSE_20S_DURATION / ANALYSE_20S_SAMPLE_INTERVAL), 1)
     for i in range(nb_mesures + 1):
         elapsed = round(time.time() - start)
         pair = fetch_pair_data(mint)
         mc = None
+        buys_m5 = sells_m5 = None
         if pair:
             mc = pair.get("marketCap", 0) or pair.get("fdv", 0)
-        samples.append((elapsed, mc))
+            txns_m5 = (pair.get("txns") or {}).get("m5") or {}
+            buys_m5 = txns_m5.get("buys")
+            sells_m5 = txns_m5.get("sells")
+        samples.append((elapsed, mc, buys_m5, sells_m5))
         if i < nb_mesures:
             time.sleep(ANALYSE_20S_SAMPLE_INTERVAL)
 
-    valides = [(s, mc) for s, mc in samples if mc]
-    if not valides:
-        print(f"[analyse_20s] aucune donnée exploitable pour {mint}")
-        return
+    # --- Point le plus bas (comme avant) ---
+    valides = [(s, mc) for s, mc, _, _ in samples if mc]
+    if valides:
+        low_second, low_mc = min(valides, key=lambda x: x[1])
+        low_mult = low_mc / initial_mc
+        if mint in active_tokens:
+            active_tokens[mint]["low_second_20s"] = low_second
+            active_tokens[mint]["low_mult_20s"] = round(low_mult, 3)
+        print(f"[analyse_20s] {data['symbol']} ({mint}) — point le plus bas à {low_second}s (x{low_mult:,.2f})")
+    else:
+        print(f"[analyse_20s] aucune donnée de market cap exploitable pour {mint}")
 
-    # Point le plus BAS atteint sur la fenêtre (le "creux" des 20 premières
-    # secondes) — utile pour savoir si le token dump avant de repartir, et
-    # à quel moment précis ça arrive (ex: pour estimer un point d'entrée
-    # réaliste).
-    low_second, low_mc = min(valides, key=lambda x: x[1])
-    low_mult = low_mc / initial_mc
+    # --- Deltas achats/ventes entre chaque poll consécutif ---
+    deltas = []  # (elapsed_debut, elapsed_fin, delta_achats, delta_ventes)
+    for (e_prev, _, b_prev, s_prev), (e_next, _, b_next, s_next) in zip(samples, samples[1:]):
+        if None in (b_prev, s_prev, b_next, s_next):
+            continue
+        # Le compteur m5 est cumulatif sur une fenêtre glissante ; en théorie
+        # il ne devrait pas décroître sur 2s, mais on protège quand même
+        # contre un léger recalcul côté DexScreener.
+        delta_achats = max(b_next - b_prev, 0)
+        delta_ventes = max(s_next - s_prev, 0)
+        deltas.append((e_prev, e_next, delta_achats, delta_ventes))
+
+    achats_bruts_2s = None
+    if deltas:
+        _, _, premier_delta_achats, premier_delta_ventes = deltas[0]
+        achats_bruts_2s = premier_delta_achats - premier_delta_ventes
+
+    def _buy_ratio(fenetre_max_s):
+        achats_cumules = sum(da for _, e_fin, da, _ in deltas if e_fin <= fenetre_max_s)
+        ventes_cumulees = sum(dv for _, e_fin, _, dv in deltas if e_fin <= fenetre_max_s)
+        total = achats_cumules + ventes_cumulees
+        return round(achats_cumules / total, 3) if total else None
+
+    buy_ratio_10s = _buy_ratio(10)
+    buy_ratio_20s = _buy_ratio(ANALYSE_20S_DURATION)
 
     if mint in active_tokens:
-        active_tokens[mint]["low_second_20s"] = low_second
-        active_tokens[mint]["low_mult_20s"] = round(low_mult, 3)
+        active_tokens[mint]["buy_ratio_10s"] = buy_ratio_10s
+        active_tokens[mint]["buy_ratio_20s"] = buy_ratio_20s
+        active_tokens[mint]["achats_bruts_2s"] = achats_bruts_2s
 
-    print(f"[analyse_20s] {data['symbol']} ({mint}) — point le plus bas à {low_second}s (x{low_mult:,.2f})")
+    print(
+        f"[analyse_20s] {data['symbol']} ({mint}) — "
+        f"buy_ratio_10s={buy_ratio_10s} buy_ratio_20s={buy_ratio_20s} achats_bruts_2s={achats_bruts_2s}"
+    )
 
 
 def essayer_alerter(mint, pair, source_url):
@@ -402,10 +462,20 @@ def essayer_alerter(mint, pair, source_url):
         print(f"[filtré] {symbol} ({mint}) — MC=${market_cap:,.0f} Liq=${liquidity_usd:,.0f}")
         return False
 
-    rug_ok, rug_score, rug_flags, top10_pct, insiders_detected = rugcheck_verdict(mint)
+    rug_ok, rug_score, rug_flags, top10_pct, insiders_detected, lp_locked_pct = rugcheck_verdict(mint)
     if not rug_ok:
         print(f"[rugcheck] {symbol} ({mint}) rejeté — score={rug_score} flags={rug_flags} top10={top10_pct}")
         return False
+
+    # Ancienneté du pool au moment de l'alerte, déduite de pairCreatedAt
+    # (timestamp en millisecondes fourni par DexScreener).
+    pair_created_at = pair.get("pairCreatedAt")
+    pool_age_seconds = None
+    if pair_created_at:
+        try:
+            pool_age_seconds = round(time.time() - (float(pair_created_at) / 1000))
+        except (TypeError, ValueError):
+            pool_age_seconds = None
 
     # Données supplémentaires, non utilisées comme filtre (sauf si activé
     # via REJECT_TOP10_PCT / REJECT_IF_INSIDERS ci-dessus), juste pour le
@@ -453,6 +523,8 @@ def essayer_alerter(mint, pair, source_url):
         "rugcheck_flags": flags_txt,
         "top10_pct": top10_pct,
         "insiders_detected": insiders_detected,
+        "lp_locked_pct": lp_locked_pct,
+        "pool_age_seconds": pool_age_seconds,
         "start_time": time.time(),
         "dex_url": pair_url_link,  # <-- pour le lien dans le rapport 30 min
         "entry_stats": entry_stats,  # <-- pour le log CSV à la fin du suivi
@@ -650,6 +722,8 @@ def monitor_ath():
                 "alertes_rugcheck": data.get("rugcheck_flags"),
                 "pct_top10_holders": data.get("top10_pct"),
                 "insiders_detectes": data.get("insiders_detected"),
+                "pool_age_seconds": data.get("pool_age_seconds"),
+                "lp_locked_pct": data.get("lp_locked_pct"),
                 "achats_m5": entry_stats.get("txns_buys_m5"),
                 "ventes_m5": entry_stats.get("txns_sells_m5"),
                 "volume_m5": entry_stats.get("volume_m5"),
@@ -658,6 +732,9 @@ def monitor_ath():
                 "volume_h1": entry_stats.get("volume_h1"),
                 "seconde_prix_plus_bas_20s": data.get("low_second_20s"),
                 "multiplicateur_plus_bas_20s": data.get("low_mult_20s"),
+                "buy_ratio_10s": data.get("buy_ratio_10s"),
+                "buy_ratio_20s": data.get("buy_ratio_20s"),
+                "achats_bruts_2s": data.get("achats_bruts_2s"),
             })
 
             tokens_to_remove.append(mint)
