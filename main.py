@@ -34,6 +34,21 @@ MIN_LIQUIDITY_RATIO = 0.03    # liquidité doit représenter au moins 3% du mark
 # PumpSwap ou Raydium. On ne veut alerter QUE sur les tokens déjà migrés.
 DEX_MIGRES = {"pumpswap", "raydium"}
 
+# --- CONCENTRATION DES HOLDERS (topHolders / insiders, via RugCheck) ---
+# RugCheck renvoie déjà topHolders + insiderReport dans le même appel que
+# le score de risque : pas besoin d'une API supplémentaire. On se contente
+# d'aller lire ces champs dans la réponse JSON déjà reçue.
+#
+# REJECT_TOP10_PCT : si défini (ex: 50.0), rejette automatiquement tout
+# token dont les 10 premiers wallets détiennent plus de ce % de l'offre.
+# Laisse à None pour juste LOGUER la valeur sans filtrer (recommandé au
+# début, le temps de voir ce que ça donne dans le CSV).
+REJECT_TOP10_PCT = None
+
+# REJECT_IF_INSIDERS : si True, rejette tout token où RugCheck détecte des
+# wallets "insiders" liés entre eux (graphInsidersDetected > 0).
+REJECT_IF_INSIDERS = False
+
 # --- ANALYSE DES 20 PREMIÈRES SECONDES ---
 # Juste après l'alerte, on sonde le prix à haute fréquence (toutes les
 # ANALYSE_20S_SAMPLE_INTERVAL secondes) pendant ANALYSE_20S_DURATION
@@ -59,6 +74,7 @@ LOG_FIELDS = [
     "initial_mc", "max_mc", "multiplicateur",
     "liquidity_usd", "liquidity_ratio",
     "rugcheck_score", "rugcheck_flags",
+    "top10_pct", "insiders_detected",
     "txns_buys_m5", "txns_sells_m5", "volume_m5",
     "txns_buys_h1", "txns_sells_h1", "volume_h1",
     "peak_second_20s", "peak_mult_20s",
@@ -102,10 +118,32 @@ def passe_les_filtres(market_cap, liquidity_usd):
 RUGCHECK_MAX_SCORE = 20
 
 
+def _extraire_concentration_holders(data):
+    """
+    Extrait la concentration des 10 premiers wallets + le nombre d'insiders
+    détectés depuis une réponse RugCheck déjà récupérée (aucun appel réseau
+    supplémentaire). Retourne (top10_pct: float|None, insiders_detected: int).
+    """
+    top_holders = data.get("topHolders") or []
+    top10_pct = None
+    if top_holders:
+        try:
+            # Chaque entrée a généralement un champ "pct" (part détenue en %).
+            top10_pct = round(sum(h.get("pct", 0) or 0 for h in top_holders[:10]), 2)
+        except (TypeError, ValueError):
+            top10_pct = None
+
+    insider_report = data.get("insiderReport") or {}
+    insiders_detected = insider_report.get("graphInsidersDetected", 0) or 0
+
+    return top10_pct, insiders_detected
+
+
 def rugcheck_verdict(mint):
     """
     Interroge RugCheck.xyz (API publique, sans clé) pour un score de risque.
-    Retourne (ok: bool, score: int|None, flags: list[str]).
+    Retourne (ok: bool, score: int|None, flags: list[str], top10_pct: float|None,
+    insiders_detected: int).
     En cas d'erreur ou de timeout, on considère le token comme "non vérifiable"
     et on ne l'envoie pas (mieux vaut rater une alerte qu'en envoyer une dangereuse).
     """
@@ -114,7 +152,7 @@ def rugcheck_verdict(mint):
         res = requests.get(url, timeout=8)
         if res.status_code != 200:
             print(f"[rugcheck] status={res.status_code} pour {mint}")
-            return False, None, []
+            return False, None, [], None, 0
 
         data = res.json()
         score = data.get("score_normalised")
@@ -122,15 +160,26 @@ def rugcheck_verdict(mint):
         flags = [r.get("name", "?") for r in risks if r.get("level") in ("warn", "danger")]
         lp_locked = data.get("lpLockedPct", 0)
 
+        top10_pct, insiders_detected = _extraire_concentration_holders(data)
+
         if score is None:
-            return False, None, flags
+            return False, None, flags, top10_pct, insiders_detected
 
         ok = score <= RUGCHECK_MAX_SCORE and lp_locked and lp_locked > 0
-        return ok, score, flags
+
+        if ok and REJECT_TOP10_PCT is not None and top10_pct is not None and top10_pct > REJECT_TOP10_PCT:
+            print(f"[rugcheck] {mint} rejeté — concentration top10={top10_pct}% > {REJECT_TOP10_PCT}%")
+            ok = False
+
+        if ok and REJECT_IF_INSIDERS and insiders_detected > 0:
+            print(f"[rugcheck] {mint} rejeté — {insiders_detected} insiders détectés")
+            ok = False
+
+        return ok, score, flags, top10_pct, insiders_detected
 
     except Exception as e:
         print(f"[rugcheck] erreur pour {mint} : {e}")
-        return False, None, []
+        return False, None, [], None, 0
 
 
 def get_true_ath_mc(pool_address, initial_mc, initial_price, start_time):
@@ -356,13 +405,14 @@ def essayer_alerter(mint, pair, source_url):
         print(f"[filtré] {symbol} ({mint}) — MC=${market_cap:,.0f} Liq=${liquidity_usd:,.0f}")
         return False
 
-    rug_ok, rug_score, rug_flags = rugcheck_verdict(mint)
+    rug_ok, rug_score, rug_flags, top10_pct, insiders_detected = rugcheck_verdict(mint)
     if not rug_ok:
-        print(f"[rugcheck] {symbol} ({mint}) rejeté — score={rug_score} flags={rug_flags}")
+        print(f"[rugcheck] {symbol} ({mint}) rejeté — score={rug_score} flags={rug_flags} top10={top10_pct}")
         return False
 
-    # Données supplémentaires, non utilisées comme filtre, juste pour le log
-    # et la comparaison a posteriori (voir LOG_FIELDS).
+    # Données supplémentaires, non utilisées comme filtre (sauf si activé
+    # via REJECT_TOP10_PCT / REJECT_IF_INSIDERS ci-dessus), juste pour le
+    # log et la comparaison a posteriori (voir LOG_FIELDS).
     txns = pair.get("txns") or {}
     volume = pair.get("volume") or {}
     txns_m5 = txns.get("m5") or {}
@@ -378,6 +428,7 @@ def essayer_alerter(mint, pair, source_url):
     }
 
     flags_txt = ", ".join(rug_flags) if rug_flags else "Aucun"
+    top10_txt = f"{top10_pct}%" if top10_pct is not None else "N/A"
     msg_ok = (
         f"✅ *Nouveau Token Solana Détecté !*\n\n"
         f"🪙 Nom : {name} ({symbol})\n"
@@ -386,12 +437,14 @@ def essayer_alerter(mint, pair, source_url):
         f"💧 Liquidité USD : ${liquidity_usd:,.0f}\n"
         f"🛡️ RugCheck Score : {rug_score}/100\n"
         f"🚩 Flags : {flags_txt}\n"
+        f"👥 Top 10 holders : {top10_txt}\n"
+        f"🕵️ Insiders détectés : {insiders_detected}\n"
         f"🔗 [Voir sur DexScreener]({pair_url_link})\n"
         f"⚡ [Trader sur Axiom](https://axiom.trade/meme/{mint})\n"
         f"🔍 [Voir sur RugCheck](https://rugcheck.xyz/tokens/{mint})"
     )
     send_telegram_message(msg_ok)
-    print(f"Alerte envoyée pour : {symbol} ({mint}) — RugCheck score={rug_score}")
+    print(f"Alerte envoyée pour : {symbol} ({mint}) — RugCheck score={rug_score} top10={top10_pct}%")
 
     active_tokens[mint] = {
         "symbol": symbol,
@@ -401,6 +454,8 @@ def essayer_alerter(mint, pair, source_url):
         "liquidity_usd": liquidity_usd,
         "rugcheck_score": rug_score,
         "rugcheck_flags": flags_txt,
+        "top10_pct": top10_pct,
+        "insiders_detected": insiders_detected,
         "start_time": time.time(),
         "dex_url": pair_url_link,  # <-- pour le lien dans le rapport 30 min
         "entry_stats": entry_stats,  # <-- pour le log CSV à la fin du suivi
@@ -596,6 +651,8 @@ def monitor_ath():
                 "liquidity_ratio": entry_stats.get("liquidity_ratio"),
                 "rugcheck_score": data.get("rugcheck_score"),
                 "rugcheck_flags": data.get("rugcheck_flags"),
+                "top10_pct": data.get("top10_pct"),
+                "insiders_detected": data.get("insiders_detected"),
                 "txns_buys_m5": entry_stats.get("txns_buys_m5"),
                 "txns_sells_m5": entry_stats.get("txns_sells_m5"),
                 "volume_m5": entry_stats.get("volume_m5"),
