@@ -78,11 +78,13 @@ LOG_FIELDS = [
     "liquidite_usd", "ratio_liquidite",
     "score_rugcheck", "alertes_rugcheck",
     "pct_top10_holders", "insiders_detectes",
+    "nombre_holders", "bundle_detecte",
     "pool_age_seconds", "lp_locked_pct",
     "achats_m5", "ventes_m5", "volume_m5",
     "achats_h1", "ventes_h1", "volume_h1",
     "seconde_prix_plus_bas_20s", "multiplicateur_plus_bas_20s",
     "buy_ratio_10s", "buy_ratio_20s", "achats_bruts_2s",
+    "price_change_m5", "tx_accel", "buy_ratio_2s",
 ]
 
 
@@ -437,9 +439,12 @@ def analyser_20_premieres_secondes(mint):
         deltas.append((e_prev, e_next, delta_achats, delta_ventes))
 
     achats_bruts_2s = None
+    buy_ratio_2s = None
     if deltas:
         _, _, premier_delta_achats, premier_delta_ventes = deltas[0]
         achats_bruts_2s = premier_delta_achats - premier_delta_ventes
+        total_2s = premier_delta_achats + premier_delta_ventes
+        buy_ratio_2s = round(premier_delta_achats / total_2s, 3) if total_2s > 0 else None
 
     def _buy_ratio(fenetre_max_s):
         achats_cumules = sum(da for _, e_fin, da, _ in deltas if e_fin <= fenetre_max_s)
@@ -454,10 +459,11 @@ def analyser_20_premieres_secondes(mint):
         active_tokens[mint]["buy_ratio_10s"] = buy_ratio_10s
         active_tokens[mint]["buy_ratio_20s"] = buy_ratio_20s
         active_tokens[mint]["achats_bruts_2s"] = achats_bruts_2s
+        active_tokens[mint]["buy_ratio_2s"] = buy_ratio_2s
 
     print(
         f"[analyse_20s] {data['symbol']} ({mint}) — "
-        f"buy_ratio_10s={buy_ratio_10s} buy_ratio_20s={buy_ratio_20s} achats_bruts_2s={achats_bruts_2s}"
+        f"buy_ratio_2s={buy_ratio_2s} buy_ratio_10s={buy_ratio_10s} buy_ratio_20s={buy_ratio_20s} achats_bruts_2s={achats_bruts_2s}"
     )
 
 
@@ -514,6 +520,20 @@ def essayer_alerter(mint, pair, source_url):
     volume = pair.get("volume") or {}
     txns_m5 = txns.get("m5") or {}
     txns_h1 = txns.get("h1") or {}
+
+    # Variation de prix sur 5 min (déjà fournie par DexScreener).
+    price_change_m5 = (pair.get("priceChange") or {}).get("m5")
+
+    # Accélération relative de l'activité : rythme des 5 dernières minutes
+    # extrapolé sur 1h (x12), comparé au volume de transactions réellement
+    # observé sur la dernière heure. ATTENTION : h1 inclut déjà les 5
+    # dernières minutes (m5 n'est pas une période indépendante de h1), donc
+    # à interpréter comme "rythme récent vs moyenne horaire incluant ce
+    # rythme récent", pas comme deux fenêtres strictement disjointes.
+    tot_m5 = (txns_m5.get("buys") or 0) + (txns_m5.get("sells") or 0)
+    tot_h1 = (txns_h1.get("buys") or 0) + (txns_h1.get("sells") or 0)
+    tx_accel = round((tot_m5 * 12) / tot_h1, 3) if tot_h1 > 0 else None
+
     entry_stats = {
         "liquidity_ratio": round(liquidity_usd / market_cap, 4) if market_cap else None,
         "txns_buys_m5": txns_m5.get("buys"),
@@ -522,6 +542,8 @@ def essayer_alerter(mint, pair, source_url):
         "txns_buys_h1": txns_h1.get("buys"),
         "txns_sells_h1": txns_h1.get("sells"),
         "volume_h1": volume.get("h1"),
+        "price_change_m5": price_change_m5,
+        "tx_accel": tx_accel,
     }
 
     flags_txt = ", ".join(rug_flags) if rug_flags else "Aucun"
@@ -758,6 +780,8 @@ def monitor_ath():
                 "alertes_rugcheck": data.get("rugcheck_flags"),
                 "pct_top10_holders": data.get("top10_pct"),
                 "insiders_detectes": data.get("insiders_detected"),
+                "nombre_holders": data.get("total_holders"),
+                "bundle_detecte": data.get("bundle_detected"),
                 "pool_age_seconds": data.get("pool_age_seconds"),
                 "lp_locked_pct": data.get("lp_locked_pct"),
                 "achats_m5": entry_stats.get("txns_buys_m5"),
@@ -771,6 +795,9 @@ def monitor_ath():
                 "buy_ratio_10s": data.get("buy_ratio_10s"),
                 "buy_ratio_20s": data.get("buy_ratio_20s"),
                 "achats_bruts_2s": data.get("achats_bruts_2s"),
+                "price_change_m5": entry_stats.get("price_change_m5"),
+                "tx_accel": entry_stats.get("tx_accel"),
+                "buy_ratio_2s": data.get("buy_ratio_2s"),
             })
 
             tokens_to_remove.append(mint)
