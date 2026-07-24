@@ -35,42 +35,426 @@ MIN_LIQUIDITY_RATIO = 0.03    # liquidité doit représenter au moins 3% du mark
 DEX_MIGRES = {"pumpswap", "raydium"}
 
 # --- CONCENTRATION DES HOLDERS (topHolders / risks, via RugCheck) ---
-# RugCheck renvoie déjà topHolders + risks dans le même appel que le score
-# de risque : pas besoin d'une API supplémentaire. On se contente d'aller
-# lire ces champs dans la réponse JSON déjà reçue.
-#
-# REJECT_TOP10_PCT : si défini (ex: 50.0), rejette automatiquement tout
-# token dont les 10 premiers wallets détiennent plus de ce % de l'offre.
-# Laisse à None pour juste LOGUER la valeur sans filtrer (recommandé au
-# début, le temps de voir ce que ça donne dans le CSV).
 REJECT_TOP10_PCT = None
-
-# REJECT_IF_INSIDERS : si True, rejette tout token où RugCheck détecte au
-# moins une alerte de concentration/insiders dans sa liste "risks"
-# (single_holder, high_concentration).
 REJECT_IF_INSIDERS = False
 
 # --- ANALYSE DES 20 PREMIÈRES SECONDES ---
-# Juste après l'alerte, on sonde le prix (et les txns m5) à haute fréquence
-# (toutes les ANALYSE_20S_SAMPLE_INTERVAL secondes) pendant
-# ANALYSE_20S_DURATION secondes, pour savoir à quelle seconde précise le
-# token atteint son premier creux, et pour estimer l'activité achats/ventes
-# réelle sur cette fenêtre (par delta, voir plus bas). Tourne dans un thread
-# séparé pour ne jamais bloquer la boucle principale (qui, elle, ne tourne
-# que toutes les 10s).
 ANALYSE_20S_SAMPLE_INTERVAL = 2   # secondes entre 2 mesures
 ANALYSE_20S_DURATION = 20         # durée totale observée
 
-# --- LOG POUR ANALYSE STATISTIQUE ---
-# Chaque token, une fois son suivi de 30 min terminé, est ajouté comme une
-# ligne dans ce CSV : toutes les données qu'on avait AU MOMENT DE L'ALERTE
-# (donc disponibles à l'avance) + le résultat final (multiplicateur). Ça
-# permet de comparer après coup ce qui différencie les tokens qui font x2+
-# de ceux qui ne font rien.
-# Attention : sur Railway, le système de fichiers est éphémère lors d'un
-# redéploiement. Pour un historique qui survit aux redéploiements, il
-# faudrait plutôt écrire vers un Google Sheet, une base externe (ex.
-# Supabase/Postgres), ou un volume persistant Railway.
+# ============================================================
+# --- MODULE DEV CLUSTER : tracking de l'arbre de wallets ---
+# ============================================================
+#
+# LIMITATION IMPORTANTE À CONNAÎTRE AVANT D'UTILISER CE MODULE :
+# Ce module utilise le RPC PUBLIC Solana (gratuit, sans clé), pas Helius.
+# Conséquences concrètes :
+#   - Rate limit bas et partagé avec tout le monde (~40 req/s en théorie,
+#     bien moins en pratique) -> des erreurs/timeouts sont NORMAUX, le code
+#     ci-dessous les tolère (retourne des résultats partiels plutôt que de
+#     planter).
+#   - Pas d'API "enhanced" : on doit parser nous-mêmes les instructions
+#     brutes de chaque transaction pour repérer les transferts SOL et les
+#     créations de tokens Pump.fun.
+#   - La détection des "tokens créés par ce wallet" est un BEST-EFFORT basé
+#     sur l'historique de signatures du wallet (limité à
+#     CLUSTER_MAX_TX_HISTORIQUE transactions par wallet) : un dev très actif
+#     avec un historique plus long que ça peut avoir des tokens plus anciens
+#     non détectés.
+#   - L'identification du wallet "créateur" (dev) d'un mint utilise l'API
+#     publique de Pump.fun (frontend-api.pump.fun). Cet endpoint n'est PAS
+#     officiellement documenté et peut changer sans préavis — à vérifier/
+#     ajuster si ça casse en prod (teste avec un mint connu avant de
+#     déployer).
+
+SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+
+# Programmes système / DEX connus et fiables à exclure de l'exploration
+# (ce ne sont pas des "wallets" du dev, juste des comptes de programme).
+# Cette liste ne contient QUE des adresses de programmes vérifiables ; elle
+# ne contient PAS d'adresses de CEX (je n'ai pas de liste à jour fiable à
+# te fournir de mémoire — complète-la toi-même via des labels Solscan si tu
+# veux aussi couper l'exploration sur les hot wallets d'exchanges).
+BLACKLIST_ADDRESSES = {
+    "11111111111111111111111111111111",           # System Program
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  # SPL Token Program
+    "ComputeBudget111111111111111111111111111111",  # Compute Budget Program
+    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",  # Pump.fun Program
+    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",  # Raydium AMM V4
+}
+
+MAX_DEPTH = 2                     # profondeur d'exploration (aval ET amont)
+CLUSTER_MIN_SOL = 0.02            # ignore les transferts SOL en dessous (poussière/frais)
+CLUSTER_MAX_TX_HISTORIQUE = 200   # nb max de tx analysées par wallet (coût RPC)
+CLUSTER_MAX_WALLETS = 25          # garde-fou anti-explosion combinatoire
+CLUSTER_MAX_FANOUT = 15           # au-delà, un wallet est probablement un hub/CEX -> on ignore ses destinataires
+MAX_CLUSTER_THREADS_PARALLELES = 2  # limite le nb d'explorations de cluster en même temps
+
+_cluster_semaphore = threading.Semaphore(MAX_CLUSTER_THREADS_PARALLELES)
+
+_rpc_id_counter = 0
+_rpc_id_lock = threading.Lock()
+
+
+def _next_rpc_id():
+    global _rpc_id_counter
+    with _rpc_id_lock:
+        _rpc_id_counter += 1
+        return _rpc_id_counter
+
+
+def rpc_call(method, params, retries=2, timeout=15):
+    """
+    Appel générique au RPC Solana public, avec un léger retry (le RPC public
+    renvoie souvent des erreurs 429/timeout sous charge). Retourne le champ
+    "result" de la réponse, ou None en cas d'échec après tous les retries.
+    """
+    payload = {
+        "jsonrpc": "2.0",
+        "id": _next_rpc_id(),
+        "method": method,
+        "params": params,
+    }
+    for tentative in range(retries + 1):
+        try:
+            res = requests.post(SOLANA_RPC_URL, json=payload, timeout=timeout)
+            if res.status_code == 200:
+                data = res.json()
+                if "error" in data:
+                    print(f"[rpc] {method} erreur RPC : {data['error']}")
+                    return None
+                return data.get("result")
+            if res.status_code == 429:
+                time.sleep(1.5 * (tentative + 1))  # backoff sur rate limit
+                continue
+            print(f"[rpc] {method} status={res.status_code}")
+        except Exception as e:
+            print(f"[rpc] {method} exception : {e}")
+        time.sleep(0.5 * (tentative + 1))
+    return None
+
+
+def get_signatures_for_address(address, limit=CLUSTER_MAX_TX_HISTORIQUE):
+    result = rpc_call(
+        "getSignaturesForAddress",
+        [address, {"limit": limit}],
+    )
+    return result or []
+
+
+def get_transaction(signature):
+    return rpc_call(
+        "getTransaction",
+        [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}],
+    )
+
+
+def extraire_transferts_sol(tx):
+    """
+    Parcourt les instructions "parsed" d'une transaction et retourne la
+    liste des transferts SOL natifs (System Program "transfer"), sous la
+    forme [(source, destination, montant_sol), ...]. Ignore les transferts
+    de tokens SPL (pas pertinents pour retracer le financement en gas).
+    """
+    transferts = []
+    if not tx:
+        return transferts
+    try:
+        message = (tx.get("transaction") or {}).get("message") or {}
+        instructions = message.get("instructions") or []
+        for ix in instructions:
+            parsed = ix.get("parsed")
+            if not parsed or ix.get("program") != "system":
+                continue
+            if parsed.get("type") != "transfer":
+                continue
+            info = parsed.get("info") or {}
+            source = info.get("source")
+            destination = info.get("destination")
+            lamports = info.get("lamports", 0)
+            if source and destination and lamports:
+                transferts.append((source, destination, lamports / 1_000_000_000))
+    except Exception as e:
+        print(f"[extraire_transferts_sol] erreur : {e}")
+    return transferts
+
+
+def trouver_wallet_financeur(wallet):
+    """
+    Remonte l'historique COMPLET disponible (jusqu'à CLUSTER_MAX_TX_HISTORIQUE
+    tx) du wallet pour trouver le tout premier transfert SOL ENTRANT reçu
+    -> c'est le "funding origin" (le wallet qui a payé le gas initial).
+    getSignaturesForAddress renvoie du plus récent au plus ancien : on part
+    donc de la fin de la liste pour retomber sur les transactions les plus
+    anciennes en premier.
+    Retourne (adresse_financeur, montant_sol, signature, block_time) ou
+    (None, None, None, None) si rien trouvé.
+    """
+    sigs = get_signatures_for_address(wallet)
+    if not sigs:
+        return None, None, None, None
+
+    for sig_info in reversed(sigs):  # du plus ancien au plus récent
+        tx = get_transaction(sig_info.get("signature"))
+        for source, destination, montant in extraire_transferts_sol(tx):
+            if destination == wallet and source != wallet and montant >= CLUSTER_MIN_SOL:
+                return source, montant, sig_info.get("signature"), sig_info.get("blockTime")
+    return None, None, None, None
+
+
+def trouver_sous_wallets(wallet):
+    """
+    Parcourt l'historique du wallet et agrège tous les transferts SOL
+    SORTANTS par destinataire (montant total envoyé), en excluant la
+    blacklist et les montants sous CLUSTER_MIN_SOL.
+    Retourne une liste de (destinataire, montant_total_sol), triée par
+    montant décroissant. Si le wallet a envoyé à plus de CLUSTER_MAX_FANOUT
+    adresses différentes, on considère que c'est probablement un hub/CEX et
+    on retourne une liste vide (pour ne pas exploser l'arbre).
+    """
+    sigs = get_signatures_for_address(wallet)
+    totaux = {}
+    for sig_info in sigs:
+        tx = get_transaction(sig_info.get("signature"))
+        for source, destination, montant in extraire_transferts_sol(tx):
+            if source != wallet or destination == wallet:
+                continue
+            if destination in BLACKLIST_ADDRESSES or montant < CLUSTER_MIN_SOL:
+                continue
+            totaux[destination] = totaux.get(destination, 0) + montant
+
+    if len(totaux) > CLUSTER_MAX_FANOUT:
+        print(f"[trouver_sous_wallets] {wallet} a >{CLUSTER_MAX_FANOUT} destinataires -> probable hub, ignoré")
+        return []
+
+    return sorted(totaux.items(), key=lambda x: x[1], reverse=True)
+
+
+def explorer_arbre_aval(wallet, profondeur_restante, wallets_deja_vus):
+    """
+    Descend récursivement l'arbre de distribution (dev -> sous-wallets ->
+    sous-sous-wallets...) jusqu'à max_depth, avec un garde-fou sur le
+    nombre total de wallets explorés (CLUSTER_MAX_WALLETS).
+    Retourne une liste de dicts {"wallet":..., "montant_recu":..., "niveau":...}.
+    """
+    resultat = []
+    if profondeur_restante < 0 or len(wallets_deja_vus) >= CLUSTER_MAX_WALLETS:
+        return resultat
+
+    sous_wallets = trouver_sous_wallets(wallet)
+    for dest, montant in sous_wallets:
+        if len(wallets_deja_vus) >= CLUSTER_MAX_WALLETS:
+            break
+        if dest in wallets_deja_vus:
+            continue
+        wallets_deja_vus.add(dest)
+        niveau = MAX_DEPTH - profondeur_restante + 1
+        resultat.append({"wallet": dest, "montant_recu": round(montant, 3), "niveau": niveau})
+        if profondeur_restante > 0:
+            resultat.extend(explorer_arbre_aval(dest, profondeur_restante - 1, wallets_deja_vus))
+
+    return resultat
+
+
+def get_pump_fun_creator(mint):
+    """
+    Récupère l'adresse du wallet créateur (dev) d'un token via l'API
+    publique de Pump.fun. ATTENTION : endpoint non officiel, à vérifier
+    avant mise en prod (teste avec un mint connu). Retourne None en cas
+    d'échec, plutôt que de faire planter le reste du pipeline.
+    """
+    try:
+        url = f"https://frontend-api.pump.fun/coins/{mint}"
+        res = requests.get(url, timeout=8, headers={"Accept": "application/json"})
+        if res.status_code != 200:
+            print(f"[pump_fun_creator] status={res.status_code} pour {mint}")
+            return None
+        data = res.json()
+        return data.get("creator")
+    except Exception as e:
+        print(f"[pump_fun_creator] erreur pour {mint} : {e}")
+        return None
+
+
+def trouver_tokens_crees_par_wallet(wallet):
+    """
+    BEST-EFFORT : parcourt l'historique de signatures du wallet et détecte
+    les transactions qui incluent une instruction "create" du programme
+    Pump.fun, pour en extraire les mints créés par ce wallet. Limité aux
+    CLUSTER_MAX_TX_HISTORIQUE dernières transactions du wallet.
+    Retourne une liste de mints (str).
+    """
+    mints_crees = []
+    sigs = get_signatures_for_address(wallet)
+    for sig_info in sigs:
+        tx = get_transaction(sig_info.get("signature"))
+        if not tx:
+            continue
+        try:
+            message = (tx.get("transaction") or {}).get("message") or {}
+            account_keys = message.get("accountKeys") or []
+            programmes_impliques = {
+                (ak.get("pubkey") if isinstance(ak, dict) else ak) for ak in account_keys
+            }
+            if "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P" not in programmes_impliques:
+                continue
+            # Le mint créé est généralement le premier "post token balance"
+            # nouvellement apparu dans cette transaction.
+            meta = tx.get("meta") or {}
+            post_balances = meta.get("postTokenBalances") or []
+            pre_mints = {b.get("mint") for b in (meta.get("preTokenBalances") or [])}
+            for b in post_balances:
+                mint = b.get("mint")
+                if mint and mint not in pre_mints:
+                    mints_crees.append(mint)
+        except Exception as e:
+            print(f"[trouver_tokens_crees_par_wallet] erreur parsing tx : {e}")
+    return list(dict.fromkeys(mints_crees))  # dédoublonne en gardant l'ordre
+
+
+def calculer_multiplicateur_token(mint):
+    """
+    Calcule un multiplicateur (mc_max / mc_initial) best-effort pour un
+    ancien token, via DexScreener (pool + prix courant) + GeckoTerminal
+    (bougies OHLCV depuis la création, pour retrouver le prix initial et le
+    plus haut réel). Retourne None si les données sont insuffisantes.
+    """
+    pair = fetch_pair_data(mint)
+    if not pair:
+        return None
+    pool_address = pair.get("pairAddress")
+    price_actuel = _to_float(pair.get("priceUsd"))
+    if not pool_address or not price_actuel:
+        return None
+
+    try:
+        url = f"https://api.geckoterminal.com/api/v2/networks/solana/pools/{pool_address}/ohlcv/hour"
+        params = {"aggregate": 1, "limit": 1000, "currency": "usd", "token": "base"}
+        res = requests.get(url, params=params, timeout=8)
+        if res.status_code != 200:
+            return None
+        ohlcv_list = res.json().get("data", {}).get("attributes", {}).get("ohlcv_list", [])
+        if not ohlcv_list:
+            return None
+        # ohlcv_list est du plus récent au plus ancien selon l'API GeckoTerminal
+        prix_initial = ohlcv_list[-1][1]  # "open" de la bougie la plus ancienne dispo
+        prix_max = max(candle[2] for candle in ohlcv_list if len(candle) >= 3)
+        if not prix_initial:
+            return None
+        return round(prix_max / prix_initial, 3)
+    except Exception as e:
+        print(f"[calculer_multiplicateur_token] erreur pour {mint} : {e}")
+        return None
+
+
+def analyser_dev_cluster(mint, dev_wallet):
+    """
+    Tourne dans un THREAD SÉPARÉ (limité à MAX_CLUSTER_THREADS_PARALLELES en
+    parallèle via _cluster_semaphore, pour ne pas cramer le RPC public si
+    plusieurs tokens sont alertés proches dans le temps).
+
+    1. Remonte le financeur du wallet dev (amont, 1 niveau)
+    2. Descend l'arbre de distribution du wallet dev (aval, jusqu'à MAX_DEPTH)
+    3. Pour le wallet dev + chaque sous-wallet trouvé, cherche les tokens
+       déjà créés (best-effort) et calcule leur multiplicateur
+    4. Envoie un message Telegram récapitulatif
+    5. Stocke les stats agrégées dans active_tokens[mint] pour qu'elles
+       soient reprises dans le CSV au moment du rapport 30 min
+    """
+    with _cluster_semaphore:
+        try:
+            print(f"[cluster] début exploration pour dev={dev_wallet} (token {mint})")
+
+            financeur, montant_financeur, _, _ = trouver_wallet_financeur(dev_wallet)
+
+            wallets_vus = {dev_wallet}
+            arbre_aval = explorer_arbre_aval(dev_wallet, MAX_DEPTH - 1, wallets_vus)
+            tous_les_wallets = [dev_wallet] + [w["wallet"] for w in arbre_aval]
+
+            tous_les_mints = []
+            for w in tous_les_wallets:
+                tous_les_mints.extend(trouver_tokens_crees_par_wallet(w))
+            tous_les_mints = list(dict.fromkeys(tous_les_mints))
+            tous_les_mints = [m for m in tous_les_mints if m != mint]  # exclut le token qui vient d'être alerté
+
+            multiplicateurs = []
+            for m in tous_les_mints:
+                mult = calculer_multiplicateur_token(m)
+                if mult is not None:
+                    multiplicateurs.append(mult)
+
+            mult_moyen = round(sum(multiplicateurs) / len(multiplicateurs), 2) if multiplicateurs else None
+            mult_max = round(max(multiplicateurs), 2) if multiplicateurs else None
+            mult_min = round(min(multiplicateurs), 2) if multiplicateurs else None
+
+            # Stocke pour le CSV (repris dans monitor_ath au moment du rapport 30 min)
+            if mint in active_tokens:
+                active_tokens[mint]["cluster_wallet_count"] = len(tous_les_wallets)
+                active_tokens[mint]["cluster_dev_wallet"] = dev_wallet
+                active_tokens[mint]["cluster_funding_wallet"] = financeur
+                active_tokens[mint]["cluster_tokens_historiques"] = len(tous_les_mints)
+                active_tokens[mint]["cluster_mult_moyen"] = mult_moyen
+                active_tokens[mint]["cluster_mult_max"] = mult_max
+                active_tokens[mint]["cluster_mult_min"] = mult_min
+
+            # --- Message Telegram récapitulatif ---
+            financeur_txt = f"`{financeur[:4]}...{financeur[-4:]}`" if financeur else "Non trouvé"
+            financeur_montant_txt = f" ({montant_financeur:.2f} SOL)" if montant_financeur else ""
+
+            sous_wallets_txt = ""
+            for w in arbre_aval[:8]:  # limite l'affichage pour rester lisible sur mobile
+                addr = w["wallet"]
+                sous_wallets_txt += f"   • `{addr[:4]}...{addr[-4:]}` → {w['montant_recu']} SOL (niv. {w['niveau']})\n"
+            if len(arbre_aval) > 8:
+                sous_wallets_txt += f"   … et {len(arbre_aval) - 8} autre(s)\n"
+            if not sous_wallets_txt:
+                sous_wallets_txt = "   Aucun détecté\n"
+
+            stats_txt = "Aucun token historique détecté (best-effort, historique limité)"
+            if multiplicateurs:
+                stats_txt = (
+                    f"{len(tous_les_mints)} token(s) détecté(s) — "
+                    f"moyen x{mult_moyen} / max x{mult_max} / min x{mult_min}"
+                )
+
+            msg = (
+                f"🕵️ *Analyse Dev Cluster*\n\n"
+                f"👤 Wallet dev : `{dev_wallet[:4]}...{dev_wallet[-4:]}`\n"
+                f"💰 Financé par : {financeur_txt}{financeur_montant_txt}\n\n"
+                f"📊 Sous-wallets détectés : {len(arbre_aval)}\n"
+                f"{sous_wallets_txt}\n"
+                f"📈 Historique du cluster : {stats_txt}\n\n"
+                f"🔗 [Voir le wallet dev sur Solscan](https://solscan.io/account/{dev_wallet})"
+            )
+            send_telegram_message(msg)
+            print(f"[cluster] terminé pour {mint} — {len(tous_les_wallets)} wallets, {len(tous_les_mints)} tokens historiques")
+
+        except Exception as e:
+            print(f"[analyser_dev_cluster] erreur pour {mint} : {e}")
+
+
+def lancer_analyse_cluster_si_possible(mint):
+    """
+    Point d'entrée appelé depuis essayer_alerter(). Récupère d'abord le
+    wallet dev (via l'API Pump.fun) de façon synchrone rapide, puis lance
+    l'exploration complète (potentiellement longue) dans un thread séparé
+    pour ne jamais bloquer la boucle principale.
+    """
+    def _job():
+        dev_wallet = get_pump_fun_creator(mint)
+        if not dev_wallet:
+            print(f"[cluster] impossible de trouver le wallet dev pour {mint}, analyse annulée")
+            return
+        analyser_dev_cluster(mint, dev_wallet)
+
+    threading.Thread(target=_job, daemon=True).start()
+
+
+# ============================================================
+# --- FIN MODULE DEV CLUSTER ---
+# ============================================================
+
+
 LOG_FILE = "token_log.csv"
 LOG_FIELDS = [
     "horodatage", "mint", "symbole", "dex",
@@ -85,6 +469,9 @@ LOG_FIELDS = [
     "seconde_prix_plus_bas_20s", "multiplicateur_plus_bas_20s",
     "buy_ratio_10s", "buy_ratio_20s", "achats_bruts_2s",
     "price_change_m5", "tx_accel", "buy_ratio_2s",
+    # --- nouvelles colonnes dev cluster ---
+    "cluster_dev_wallet", "cluster_funding_wallet", "cluster_wallet_count",
+    "cluster_tokens_historiques", "cluster_mult_moyen", "cluster_mult_max", "cluster_mult_min",
 ]
 
 
@@ -102,7 +489,6 @@ def log_resultat_csv(row):
 
 
 def _to_float(value):
-    """Conversion défensive en float (le priceUsd de DexScreener est une string)."""
     try:
         return float(value) if value is not None else None
     except (TypeError, ValueError):
@@ -121,23 +507,14 @@ def passe_les_filtres(market_cap, liquidity_usd):
     return True
 
 
-# Score de risque RugCheck max toléré (0 = aucun risque, 100 = risque max)
 RUGCHECK_MAX_SCORE = 20
 
 
 def _extraire_concentration_holders(data):
-    """
-    Extrait la concentration des 10 premiers wallets depuis "topHolders",
-    et compte le nombre d'alertes de concentration/insiders présentes dans
-    la liste "risks" de RugCheck (ex: "single_holder", "high_concentration")
-    — aucun appel réseau supplémentaire, tout vient de la réponse déjà reçue.
-    Retourne (top10_pct: float|None, insiders_detected: int).
-    """
     top_holders = data.get("topHolders") or []
     top10_pct = None
     if top_holders:
         try:
-            # Chaque entrée a généralement un champ "pct" (part détenue en %).
             top10_pct = round(sum(h.get("pct", 0) or 0 for h in top_holders[:10]), 2)
         except (TypeError, ValueError):
             top10_pct = None
@@ -148,25 +525,10 @@ def _extraire_concentration_holders(data):
         1 for r in risks
         if any(kw in (r.get("name", "") or "").lower() for kw in concentration_keywords)
     )
-
     return top10_pct, insiders_detected
 
 
 def _extraire_holders_et_bundle(data):
-    """
-    Extrait le nombre total de holders et détecte un éventuel "bundle"
-    (achats groupés au lancement, signature de bots coordonnés / insiders),
-    toujours depuis la même réponse RugCheck déjà reçue.
-
-    ATTENTION : la doc publique de l'endpoint report/summary ne précise pas
-    formellement le nom du champ "nombre de holders" ni un champ dédié
-    "bundle" — on tente donc plusieurs clés plausibles, et on détecte le
-    bundle par mot-clé dans "risks" (RugCheck y ajoute généralement une
-    entrée explicite quand un bundle est détecté). Si total_holders reste
-    systématiquement None une fois en prod, inspecte une réponse brute
-    (print(data)) pour repérer le bon nom de champ et ajuste la liste
-    ci-dessous.
-    """
     total_holders = data.get("totalHolders")
     if total_holders is None:
         total_holders = data.get("holders")
@@ -176,19 +538,10 @@ def _extraire_holders_et_bundle(data):
 
     risks = data.get("risks") or []
     bundle_detected = any("bundle" in (r.get("name", "") or "").lower() for r in risks)
-
     return total_holders, bundle_detected
 
 
 def rugcheck_verdict(mint):
-    """
-    Interroge RugCheck.xyz (API publique, sans clé) pour un score de risque.
-    Retourne (ok: bool, score: int|None, flags: list[str], top10_pct: float|None,
-    insiders_detected: int, lp_locked_pct: float|None, total_holders: int|None,
-    bundle_detected: bool).
-    En cas d'erreur ou de timeout, on considère le token comme "non vérifiable"
-    et on ne l'envoie pas (mieux vaut rater une alerte qu'en envoyer une dangereuse).
-    """
     try:
         url = f"https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary"
         res = requests.get(url, timeout=8)
@@ -226,44 +579,23 @@ def rugcheck_verdict(mint):
 
 
 def get_true_ath_mc(pool_address, initial_mc, initial_price, start_time):
-    """
-    Récupère les vraies bougies OHLCV via GeckoTerminal (API publique,
-    gratuite, sans clé) pour calculer le véritable plus haut (ATH) atteint
-    depuis la migration — sans avoir besoin de sonder l'API toutes les X
-    secondes. Le "high" de chaque bougie capture les pics même s'ils ne
-    durent que quelques secondes entre deux vérifications classiques.
-
-    Retourne le market cap ATH estimé (converti à partir du ratio de prix),
-    ou None si l'appel échoue ou si on n'a pas de prix initial pour convertir
-    — dans ce cas, on retombe sur le suivi par polling classique.
-    """
     if not pool_address or not initial_price:
         return None
     try:
         elapsed_minutes = max(int((time.time() - start_time) / 60) + 5, 10)
         url = f"https://api.geckoterminal.com/api/v2/networks/solana/pools/{pool_address}/ohlcv/minute"
-        params = {
-            "aggregate": 1,
-            "limit": min(elapsed_minutes, 1000),
-            "currency": "usd",
-            "token": "base",
-        }
+        params = {"aggregate": 1, "limit": min(elapsed_minutes, 1000), "currency": "usd", "token": "base"}
         res = requests.get(url, params=params, timeout=8)
         if res.status_code != 200:
             print(f"[geckoterminal] status={res.status_code} pour {pool_address}")
             return None
-
         ohlcv_list = res.json().get("data", {}).get("attributes", {}).get("ohlcv_list", [])
         if not ohlcv_list:
             return None
-
-        # Chaque bougie : [timestamp, open, high, low, close, volume]
         max_high = max(candle[2] for candle in ohlcv_list if len(candle) >= 3)
         if not max_high:
             return None
-
         return initial_mc * (max_high / initial_price)
-
     except Exception as e:
         print(f"[geckoterminal] erreur pour {pool_address} : {e}")
         return None
@@ -286,11 +618,6 @@ def send_telegram_message(message):
 
 
 def send_telegram_document(filepath, caption=None):
-    """
-    Envoie un fichier en pièce jointe Telegram (utilisé pour le CSV de log).
-    Si le fichier n'existe pas encore (aucun token n'a terminé son suivi
-    de 30 min), on prévient l'utilisateur au lieu de planter.
-    """
     if not os.path.isfile(filepath):
         send_telegram_message(f"⚠️ Aucun fichier `{filepath}` pour le moment (aucun token n'a encore terminé son suivi de 30 min).")
         return
@@ -312,14 +639,6 @@ _telegram_update_offset = 0
 
 
 def check_telegram_commands():
-    """
-    Vérifie les nouveaux messages reçus par le bot (getUpdates) et répond
-    aux commandes reconnues. Appelée à chaque tour de la boucle principale
-    (~toutes les 10s), donc une commande peut mettre jusqu'à ~10s à être
-    traitée. On ignore tout message qui ne vient pas du CHAT_ID autorisé.
-
-    Commandes reconnues : /csv, /log, /download -> envoie le CSV complet.
-    """
     global _telegram_update_offset
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
     params = {"offset": _telegram_update_offset + 1, "timeout": 0}
@@ -345,14 +664,10 @@ def check_telegram_commands():
         if text in ("/csv", "/log", "/download"):
             send_telegram_document(LOG_FILE, caption="📊 Historique complet des tokens suivis")
         elif text == "/help":
-            send_telegram_message(
-                "Commandes disponibles :\n"
-                "/csv — télécharger le fichier de log complet"
-            )
+            send_telegram_message("Commandes disponibles :\n/csv — télécharger le fichier de log complet")
 
 
 def fetch_pair_data(mint):
-    """Récupère la 1ère pair DexScreener connue pour un mint, ou None."""
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
         res = requests.get(url, timeout=5)
@@ -366,38 +681,12 @@ def fetch_pair_data(mint):
 
 
 def analyser_20_premieres_secondes(mint):
-    """
-    Tourne dans un THREAD SÉPARÉ, lancé juste après l'alerte d'un token.
-    Sonde le market cap ET les txns m5 (achats/ventes) toutes les
-    ANALYSE_20S_SAMPLE_INTERVAL secondes pendant ANALYSE_20S_DURATION
-    secondes.
-
-    Deux types de résultats sont calculés :
-    1) Le point le plus bas atteint (comme avant) : utile pour savoir
-       statistiquement à quel moment il vaut mieux entrer.
-    2) L'activité achats/ventes réelle sur la fenêtre, calculée PAR DELTA
-       entre deux polls consécutifs. Comme DexScreener ne fournit que des
-       compteurs sur une fenêtre glissante de 5 minutes (m5), on ne peut
-       pas connaître l'activité exacte des 20 dernières secondes
-       directement — on l'approxime en regardant de combien le compteur
-       m5 a augmenté entre deux mesures rapprochées (2s d'écart) :
-         - achats_bruts_2s : achats nets (achats - ventes) survenus entre
-           le tout premier poll (t=0s) et le second (t=2s), pour mesurer
-           combien de bots/snipers rentrent instantanément.
-         - buy_ratio_10s / buy_ratio_20s : part des achats dans le total
-           achats+ventes cumulés sur, respectivement, les 10 et 20
-           premières secondes.
-
-    Le résultat est stocké dans active_tokens[mint] pour être repris dans
-    le rapport CSV final. Aucun message Telegram n'est envoyé ici : le
-    résultat n'apparaît que dans le CSV.
-    """
     data = active_tokens.get(mint)
     if not data:
         return
     initial_mc = data.get("initial_mc") or 1.0
     start = data["start_time"]
-    samples = []  # liste de (seconde_ecoulee, market_cap, achats_m5, ventes_m5)
+    samples = []
 
     nb_mesures = max(int(ANALYSE_20S_DURATION / ANALYSE_20S_SAMPLE_INTERVAL), 1)
     for i in range(nb_mesures + 1):
@@ -414,7 +703,6 @@ def analyser_20_premieres_secondes(mint):
         if i < nb_mesures:
             time.sleep(ANALYSE_20S_SAMPLE_INTERVAL)
 
-    # --- Point le plus bas (comme avant) ---
     valides = [(s, mc) for s, mc, _, _ in samples if mc]
     if valides:
         low_second, low_mc = min(valides, key=lambda x: x[1])
@@ -426,14 +714,10 @@ def analyser_20_premieres_secondes(mint):
     else:
         print(f"[analyse_20s] aucune donnée de market cap exploitable pour {mint}")
 
-    # --- Deltas achats/ventes entre chaque poll consécutif ---
-    deltas = []  # (elapsed_debut, elapsed_fin, delta_achats, delta_ventes)
+    deltas = []
     for (e_prev, _, b_prev, s_prev), (e_next, _, b_next, s_next) in zip(samples, samples[1:]):
         if None in (b_prev, s_prev, b_next, s_next):
             continue
-        # Le compteur m5 est cumulatif sur une fenêtre glissante ; en théorie
-        # il ne devrait pas décroître sur 2s, mais on protège quand même
-        # contre un léger recalcul côté DexScreener.
         delta_achats = max(b_next - b_prev, 0)
         delta_ventes = max(s_next - s_prev, 0)
         deltas.append((e_prev, e_next, delta_achats, delta_ventes))
@@ -468,20 +752,6 @@ def analyser_20_premieres_secondes(mint):
 
 
 def essayer_alerter(mint, pair, source_url):
-    """
-    Vérifie si le pair migré passe les filtres + RugCheck, et alerte si oui.
-
-    C'EST ICI qu'on capture le market cap "initial" utilisé pour le
-    multiplicateur du rapport 30 min. Cette fonction est appelée soit :
-    - dès la découverte du mint si le pool est déjà migré à ce moment-là,
-    - soit à chaque cycle (10s) tant qu'il est en attente dans pending_mints,
-    de façon à capter le market cap au tout premier instant où le pool
-    migré (Raydium/PumpSwap) est visible — et non au moment (potentiellement
-    tardif) où le bot a simplement fini par scanner le token.
-
-    Retourne True si le token a été alerté (à retirer de pending_mints),
-    False sinon.
-    """
     base_token = pair.get("baseToken") or {}
     name = base_token.get("name", "Inconnu")
     symbol = base_token.get("symbol", "Inconnu")
@@ -503,8 +773,6 @@ def essayer_alerter(mint, pair, source_url):
         print(f"[rugcheck] {symbol} ({mint}) rejeté — score={rug_score} flags={rug_flags} top10={top10_pct}")
         return False
 
-    # Ancienneté du pool au moment de l'alerte, déduite de pairCreatedAt
-    # (timestamp en millisecondes fourni par DexScreener).
     pair_created_at = pair.get("pairCreatedAt")
     pool_age_seconds = None
     if pair_created_at:
@@ -513,23 +781,12 @@ def essayer_alerter(mint, pair, source_url):
         except (TypeError, ValueError):
             pool_age_seconds = None
 
-    # Données supplémentaires, non utilisées comme filtre (sauf si activé
-    # via REJECT_TOP10_PCT / REJECT_IF_INSIDERS ci-dessus), juste pour le
-    # log et la comparaison a posteriori (voir LOG_FIELDS).
     txns = pair.get("txns") or {}
     volume = pair.get("volume") or {}
     txns_m5 = txns.get("m5") or {}
     txns_h1 = txns.get("h1") or {}
-
-    # Variation de prix sur 5 min (déjà fournie par DexScreener).
     price_change_m5 = (pair.get("priceChange") or {}).get("m5")
 
-    # Accélération relative de l'activité : rythme des 5 dernières minutes
-    # extrapolé sur 1h (x12), comparé au volume de transactions réellement
-    # observé sur la dernière heure. ATTENTION : h1 inclut déjà les 5
-    # dernières minutes (m5 n'est pas une période indépendante de h1), donc
-    # à interpréter comme "rythme récent vs moyenne horaire incluant ce
-    # rythme récent", pas comme deux fenêtres strictement disjointes.
     tot_m5 = (txns_m5.get("buys") or 0) + (txns_m5.get("sells") or 0)
     tot_h1 = (txns_h1.get("buys") or 0) + (txns_h1.get("sells") or 0)
     tx_accel = round((tot_m5 * 12) / tot_h1, 3) if tot_h1 > 0 else None
@@ -584,29 +841,32 @@ def essayer_alerter(mint, pair, source_url):
         "bundle_detected": bundle_detected,
         "pool_age_seconds": pool_age_seconds,
         "start_time": time.time(),
-        "dex_url": pair_url_link,  # <-- pour le lien dans le rapport 30 min
-        "entry_stats": entry_stats,  # <-- pour le log CSV à la fin du suivi
-        "pool_address": pair.get("pairAddress"),  # <-- pour interroger GeckoTerminal
+        "dex_url": pair_url_link,
+        "entry_stats": entry_stats,
+        "pool_address": pair.get("pairAddress"),
         "initial_price": _to_float(pair.get("priceUsd")),
+        # champs cluster, remplis plus tard en arrière-plan (peuvent rester
+        # à None si l'analyse cluster n'a pas terminé avant le rapport 30 min)
+        "cluster_dev_wallet": None,
+        "cluster_funding_wallet": None,
+        "cluster_wallet_count": None,
+        "cluster_tokens_historiques": None,
+        "cluster_mult_moyen": None,
+        "cluster_mult_max": None,
+        "cluster_mult_min": None,
     }
     seen_mints.add(mint)
 
-    # Lance l'analyse des 20 premières secondes dans un thread séparé pour
-    # ne pas bloquer la boucle principale (qui doit continuer à tourner
-    # toutes les 10s pendant ce temps-là).
     threading.Thread(target=analyser_20_premieres_secondes, args=(mint,), daemon=True).start()
+
+    # Lance l'analyse du dev cluster en arrière-plan (thread séparé, limité
+    # par _cluster_semaphore) -> ne bloque jamais la boucle principale.
+    lancer_analyse_cluster_si_possible(mint)
 
     return True
 
 
 def check_new_solana_tokens():
-    """
-    Découvre de nouveaux mints Solana via le flux de profils DexScreener.
-    Un mint déjà alerté (seen_mints) ou déjà suivi (pending_mints /
-    active_tokens) n'est pas retraité ici. S'il n'est pas encore migré,
-    on le place en attente : check_pending_tokens() le re-vérifiera à
-    chaque cycle pour capter le tout premier instant de migration.
-    """
     try:
         url = "https://api.dexscreener.com/token-profiles/latest/v1"
         response = requests.get(url, timeout=10)
@@ -616,7 +876,6 @@ def check_new_solana_tokens():
             return
 
         data = response.json()
-        # La réponse peut être une liste directe ou un objet {"data": [...]}
         profiles = data if isinstance(data, list) else data.get("data", [])
         print(f"[debug] {len(profiles)} profils reçus")
 
@@ -634,37 +893,20 @@ def check_new_solana_tokens():
             source_url = profile.get("url", "https://dexscreener.com/solana")
 
             if not pair or pair.get("dexId") not in DEX_MIGRES:
-                # Pas encore de pool, ou encore sur pump.fun (bonding curve) :
-                # on met en attente de migration.
                 pending_mints[mint] = time.time()
                 continue
 
-            # Déjà migré au moment où on le découvre : 1er point de donnée
-            # disponible, on l'utilise comme market cap initial.
             essayer_alerter(mint, pair, source_url)
 
     except Exception as e:
         print(f"Erreur lors de la vérification DexScreener : {e}")
 
 
-# Un mint en attente est re-testé au maximum toutes les PENDING_CHECK_INTERVAL
-# secondes (et non à chaque boucle de 10s) pour éviter de saturer l'API
-# DexScreener si beaucoup de mints sont en attente de migration en même temps.
-# 10s reste la meilleure précision possible sur le moment de la migration ;
-# on augmente cet intervalle seulement si le nombre de pending_mints devient
-# trop grand pour l'API.
 PENDING_CHECK_INTERVAL = 30
 _last_pending_check = 0
 
 
 def check_pending_tokens():
-    """
-    Reprend chaque mint en attente et vérifie si son pool est passé sur
-    Raydium/PumpSwap depuis le dernier passage. Ne s'exécute réellement que
-    toutes les PENDING_CHECK_INTERVAL secondes (throttling), donc on capture
-    le market cap au premier cycle de vérification où la migration devient
-    visible : c'est ça, le vrai "market cap initial".
-    """
     global _last_pending_check
     now = time.time()
 
@@ -681,29 +923,20 @@ def check_pending_tokens():
 
         pair = fetch_pair_data(mint)
         if not pair or pair.get("dexId") not in DEX_MIGRES:
-            continue  # toujours pas migré, on réessaiera au prochain cycle
+            continue
 
         essayer_alerter(mint, pair, f"https://dexscreener.com/solana/{mint}")
-        # Migré ou non retenu (filtres/rugcheck), inutile de le re-tester :
-        # un pool ne "migre" qu'une fois.
         to_remove.append(mint)
 
     for mint in to_remove:
         pending_mints.pop(mint, None)
 
 
-PRICE_CHECK_INTERVAL = 120  # ne va chercher le prix que toutes les 2 minutes
+PRICE_CHECK_INTERVAL = 120
 _last_price_check = 0
 
 
 def monitor_ath():
-    """
-    La détection de nouveaux tokens reste rapide (toutes les 10s, dans la
-    boucle principale). Ici, on ne va chercher le prix sur DexScreener que
-    toutes les PRICE_CHECK_INTERVAL secondes, pour économiser des requêtes.
-    Un seul rapport est envoyé sur Telegram, 30 minutes après la détection
-    initiale, résumant le multiplicateur max atteint.
-    """
     global _last_price_check
     current_time = time.time()
     tokens_to_remove = []
@@ -737,15 +970,8 @@ def monitor_ath():
         if elapsed >= 1800:
             initial_mc = data["initial_mc"] or 1.0
 
-            # Vrai ATH via les bougies OHLCV GeckoTerminal (capture les pics
-            # même s'ils sont passés entre deux polling classiques). On garde
-            # le max avec le suivi par polling, au cas où GeckoTerminal
-            # échoue ou ne connaît pas encore ce pool.
             true_ath_mc = get_true_ath_mc(
-                data.get("pool_address"),
-                initial_mc,
-                data.get("initial_price"),
-                data["start_time"],
+                data.get("pool_address"), initial_mc, data.get("initial_price"), data["start_time"],
             )
             print(f"[monitor_ath] {data['symbol']} ({mint}) GeckoTerminal ATH mc={true_ath_mc}")
             max_mc = max(active_tokens[mint]["max_price"], true_ath_mc or 0)
@@ -798,6 +1024,15 @@ def monitor_ath():
                 "price_change_m5": entry_stats.get("price_change_m5"),
                 "tx_accel": entry_stats.get("tx_accel"),
                 "buy_ratio_2s": data.get("buy_ratio_2s"),
+                # --- stats dev cluster (peuvent être None si l'analyse
+                # arrière-plan n'a pas terminé avant les 30 min) ---
+                "cluster_dev_wallet": data.get("cluster_dev_wallet"),
+                "cluster_funding_wallet": data.get("cluster_funding_wallet"),
+                "cluster_wallet_count": data.get("cluster_wallet_count"),
+                "cluster_tokens_historiques": data.get("cluster_tokens_historiques"),
+                "cluster_mult_moyen": data.get("cluster_mult_moyen"),
+                "cluster_mult_max": data.get("cluster_mult_max"),
+                "cluster_mult_min": data.get("cluster_mult_min"),
             })
 
             tokens_to_remove.append(mint)
