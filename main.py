@@ -469,9 +469,11 @@ LOG_FIELDS = [
     "seconde_prix_plus_bas_20s", "multiplicateur_plus_bas_20s",
     "buy_ratio_10s", "buy_ratio_20s", "achats_bruts_2s",
     "price_change_m5", "tx_accel", "buy_ratio_2s",
-    # --- nouvelles colonnes dev cluster ---
+    # --- colonnes dev cluster ---
     "cluster_dev_wallet", "cluster_funding_wallet", "cluster_wallet_count",
     "cluster_tokens_historiques", "cluster_mult_moyen", "cluster_mult_max", "cluster_mult_min",
+    # --- colonnes boost DexScreener ---
+    "boost_detecte", "nombre_boosts_actifs",
 ]
 
 
@@ -493,6 +495,18 @@ def _to_float(value):
         return float(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def extraire_infos_boost(pair):
+    """
+    Extrait les infos de boost DexScreener d'une pair. DexScreener renvoie
+    un champ "boosts": {"active": N} quand le token a des boosts payants
+    actifs (mise en avant sur leur plateforme). Retourne (bool, int).
+    """
+    boosts_info = pair.get("boosts") or {}
+    nombre_boosts_actifs = boosts_info.get("active", 0) or 0
+    boost_detecte = nombre_boosts_actifs > 0
+    return boost_detecte, nombre_boosts_actifs
 
 
 def passe_les_filtres(market_cap, liquidity_usd):
@@ -791,6 +805,9 @@ def essayer_alerter(mint, pair, source_url):
     tot_h1 = (txns_h1.get("buys") or 0) + (txns_h1.get("sells") or 0)
     tx_accel = round((tot_m5 * 12) / tot_h1, 3) if tot_h1 > 0 else None
 
+    # --- Détection boost DexScreener ---
+    boost_detecte, nombre_boosts_actifs = extraire_infos_boost(pair)
+
     entry_stats = {
         "liquidity_ratio": round(liquidity_usd / market_cap, 4) if market_cap else None,
         "txns_buys_m5": txns_m5.get("buys"),
@@ -807,6 +824,7 @@ def essayer_alerter(mint, pair, source_url):
     top10_txt = f"{top10_pct}%" if top10_pct is not None else "N/A"
     holders_txt = f"{total_holders}" if total_holders is not None else "N/A"
     bundle_txt = "⚠️ Oui" if bundle_detected else "Non"
+    boost_txt = f"⚡ Oui ({nombre_boosts_actifs})" if boost_detecte else "Non"
     msg_ok = (
         f"✅ *Nouveau Token Solana Détecté !*\n\n"
         f"🪙 Nom : {name} ({symbol})\n"
@@ -819,6 +837,7 @@ def essayer_alerter(mint, pair, source_url):
         f"👤 Nombre de holders : {holders_txt}\n"
         f"📦 Bundle détecté : {bundle_txt}\n"
         f"🕵️ Insiders détectés : {insiders_detected}\n"
+        f"🚀 Boosté DexScreener : {boost_txt}\n"
         f"🔗 [Voir sur DexScreener]({pair_url_link})\n"
         f"⚡ [Trader sur Axiom](https://axiom.trade/meme/{mint})\n"
         f"🔍 [Voir sur RugCheck](https://rugcheck.xyz/tokens/{mint})"
@@ -845,6 +864,10 @@ def essayer_alerter(mint, pair, source_url):
         "entry_stats": entry_stats,
         "pool_address": pair.get("pairAddress"),
         "initial_price": _to_float(pair.get("priceUsd")),
+        # champs boost DexScreener (mis à jour aussi dans monitor_ath si le
+        # boost apparaît après coup, pas seulement à l'alerte initiale)
+        "boost_detecte": boost_detecte,
+        "nombre_boosts_actifs": nombre_boosts_actifs,
         # champs cluster, remplis plus tard en arrière-plan (peuvent rester
         # à None si l'analyse cluster n'a pas terminé avant le rapport 30 min)
         "cluster_dev_wallet": None,
@@ -960,6 +983,17 @@ def monitor_ath():
                         print(f"[monitor_ath] {data['symbol']} ({mint}) MC actuel=${current_mc:,.0f} (max enregistré=${data['max_price']:,.0f})")
                         if current_mc and current_mc > data["max_price"]:
                             active_tokens[mint]["max_price"] = current_mc
+
+                        # Le boost peut apparaître après l'alerte initiale :
+                        # on met à jour le statut à chaque vérification prix
+                        # si un boost devient actif (on ne le "désactive"
+                        # jamais automatiquement, un boost déjà vu compte).
+                        boost_detecte_maj, nb_boosts_maj = extraire_infos_boost(pairs[0])
+                        if boost_detecte_maj:
+                            active_tokens[mint]["boost_detecte"] = True
+                            active_tokens[mint]["nombre_boosts_actifs"] = max(
+                                nb_boosts_maj, active_tokens[mint].get("nombre_boosts_actifs", 0) or 0
+                            )
                     else:
                         print(f"[monitor_ath] {data['symbol']} ({mint}) aucune pair retournée par DexScreener")
                 else:
@@ -979,12 +1013,18 @@ def monitor_ath():
             multiplicateur = max_mc / initial_mc
             dex_url = data.get("dex_url", f"https://dexscreener.com/solana/{mint}")
 
+            boost_txt_rapport = (
+                f"Oui ({data.get('nombre_boosts_actifs', 0)})"
+                if data.get("boost_detecte") else "Non"
+            )
+
             msg_rapport = (
                 f"📋 *Rapport 30 min*\n\n"
                 f"🪙 Token : {data['symbol']}\n"
                 f"💰 Market Cap initial (à la migration) : ${initial_mc:,.0f}\n"
                 f"🏆 Market Cap max atteint : ${max_mc:,.0f}\n"
                 f"✖️ Multiplicateur : x{multiplicateur:,.2f}\n"
+                f"🚀 Boosté : {boost_txt_rapport}\n"
                 f"🔗 [Voir sur DexScreener]({dex_url})\n"
                 f"⚡ [Trader sur Axiom](https://axiom.trade/meme/{mint})"
             )
@@ -1033,6 +1073,9 @@ def monitor_ath():
                 "cluster_mult_moyen": data.get("cluster_mult_moyen"),
                 "cluster_mult_max": data.get("cluster_mult_max"),
                 "cluster_mult_min": data.get("cluster_mult_min"),
+                # --- stats boost DexScreener ---
+                "boost_detecte": data.get("boost_detecte", False),
+                "nombre_boosts_actifs": data.get("nombre_boosts_actifs", 0),
             })
 
             tokens_to_remove.append(mint)
