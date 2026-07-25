@@ -668,6 +668,8 @@ LOG_FIELDS = [
     "cluster_tokens_historiques", "cluster_mult_moyen", "cluster_mult_max", "cluster_mult_min",
     # --- colonnes boost DexScreener ---
     "boost_detecte", "nombre_boosts_actifs",
+    # --- colonnes profil DexScreener (nouvelles) ---
+    "profil_dexscreener", "site_web", "twitter", "telegram",
     # --- colonnes vélocité/qualité des ordres (nouvelles) ---
     "tx_velocity_5s", "buy_ratio_5s",
     "avg_buy_size_sol", "avg_sell_size_sol",  # approximation : DexScreener ne sépare pas achats/ventes dans le volume
@@ -708,6 +710,37 @@ def extraire_infos_boost(pair):
     nombre_boosts_actifs = boosts_info.get("active", 0) or 0
     boost_detecte = nombre_boosts_actifs > 0
     return boost_detecte, nombre_boosts_actifs
+
+
+def extraire_infos_profil(pair):
+    """
+    Extrait les infos de "profil" DexScreener d'une pair : site web et
+    réseaux sociaux (Twitter/X, Telegram, etc.). Sur DexScreener, un token
+    qui a un profil rempli (souvent payant / signal d'effort marketing du
+    projet) a un champ "info" non vide, avec des sous-listes "websites" et
+    "socials".
+    Retourne (a_un_profil: bool, site_web: str|None, twitter: str|None,
+    telegram: str|None).
+    """
+    info = pair.get("info") or {}
+    websites = info.get("websites") or []
+    socials = info.get("socials") or []
+
+    a_un_profil = bool(websites or socials)
+    site_web = websites[0].get("url") if websites and isinstance(websites[0], dict) else None
+
+    twitter = None
+    telegram = None
+    for s in socials:
+        if not isinstance(s, dict):
+            continue
+        type_social = (s.get("type") or "").lower()
+        if type_social in ("twitter", "x") and not twitter:
+            twitter = s.get("url")
+        elif type_social == "telegram" and not telegram:
+            telegram = s.get("url")
+
+    return a_un_profil, site_web, twitter, telegram
 
 
 def passe_les_filtres(market_cap, liquidity_usd):
@@ -1046,6 +1079,9 @@ def essayer_alerter(mint, pair, source_url):
     # --- Détection boost DexScreener ---
     boost_detecte, nombre_boosts_actifs = extraire_infos_boost(pair)
 
+    # --- Détection profil DexScreener (site web / réseaux sociaux) ---
+    a_un_profil, site_web, twitter, telegram_link = extraire_infos_profil(pair)
+
     # --- Taille moyenne des ordres (approximation, cf. limitation ci-dessous) ---
     # DexScreener ne distingue PAS le volume acheteur du volume vendeur : on ne
     # peut donc calculer qu'une taille d'ordre MOYENNE globale, appliquée aux
@@ -1076,6 +1112,7 @@ def essayer_alerter(mint, pair, source_url):
     holders_txt = f"{total_holders}" if total_holders is not None else "N/A"
     bundle_txt = "⚠️ Oui" if bundle_detected else "Non"
     boost_txt = f"⚡ Oui ({nombre_boosts_actifs})" if boost_detecte else "Non"
+    profil_txt = "✅ Oui" if a_un_profil else "Non"
     msg_ok = (
         f"✅ *Nouveau Token Solana Détecté !*\n\n"
         f"🪙 Nom : {name} ({symbol})\n"
@@ -1089,6 +1126,7 @@ def essayer_alerter(mint, pair, source_url):
         f"📦 Bundle détecté : {bundle_txt}\n"
         f"🕵️ Insiders détectés : {insiders_detected}\n"
         f"🚀 Boosté DexScreener : {boost_txt}\n"
+        f"🌐 Profil DexScreener : {profil_txt}\n"
         f"🔗 [Voir sur DexScreener]({pair_url_link})\n"
         f"⚡ [Trader sur Axiom](https://axiom.trade/meme/{mint})\n"
         f"🔍 [Voir sur RugCheck](https://rugcheck.xyz/tokens/{mint})"
@@ -1120,6 +1158,12 @@ def essayer_alerter(mint, pair, source_url):
         # boost apparaît après coup, pas seulement à l'alerte initiale)
         "boost_detecte": boost_detecte,
         "nombre_boosts_actifs": nombre_boosts_actifs,
+        # champs profil DexScreener (mis à jour aussi dans monitor_ath si le
+        # profil apparaît/se complète après coup)
+        "profil_dexscreener": a_un_profil,
+        "site_web": site_web,
+        "twitter": twitter,
+        "telegram": telegram_link,
         # champs cluster, remplis plus tard en arrière-plan (peuvent rester
         # à None si l'analyse cluster n'a pas terminé avant le rapport 30 min)
         "cluster_dev_wallet": None,
@@ -1262,6 +1306,15 @@ def monitor_ath():
                                 nb_boosts_maj, active_tokens[mint].get("nombre_boosts_actifs", 0) or 0
                             )
 
+                        # Le profil DexScreener peut aussi être ajouté/complété
+                        # après l'alerte initiale : on met à jour si détecté.
+                        profil_detecte_maj, site_maj, twitter_maj, telegram_maj = extraire_infos_profil(pairs[0])
+                        if profil_detecte_maj:
+                            active_tokens[mint]["profil_dexscreener"] = True
+                            active_tokens[mint]["site_web"] = active_tokens[mint].get("site_web") or site_maj
+                            active_tokens[mint]["twitter"] = active_tokens[mint].get("twitter") or twitter_maj
+                            active_tokens[mint]["telegram"] = active_tokens[mint].get("telegram") or telegram_maj
+
                         # --- Simulation SL/TP (aucun ordre réel, tracking seulement) ---
                         if current_mc:
                             gerer_simulation_position(mint, current_mc, elapsed)
@@ -1369,6 +1422,11 @@ def monitor_ath():
                 # --- stats boost DexScreener ---
                 "boost_detecte": data.get("boost_detecte", False),
                 "nombre_boosts_actifs": data.get("nombre_boosts_actifs", 0),
+                # --- stats profil DexScreener ---
+                "profil_dexscreener": data.get("profil_dexscreener", False),
+                "site_web": data.get("site_web"),
+                "twitter": data.get("twitter"),
+                "telegram": data.get("telegram"),
                 # --- vélocité / qualité des ordres ---
                 "tx_velocity_5s": data.get("tx_velocity_5s"),
                 "buy_ratio_5s": data.get("buy_ratio_5s"),
