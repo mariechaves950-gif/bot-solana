@@ -43,6 +43,138 @@ ANALYSE_20S_SAMPLE_INTERVAL = 2   # secondes entre 2 mesures
 ANALYSE_20S_DURATION = 20         # durée totale observée
 
 # ============================================================
+# --- FILTRES DE TRIGGER (signal d'entrée optimisé) ---
+# ============================================================
+# Ces critères s'ajoutent AUX filtres de qualité ci-dessus (liquidité,
+# RugCheck...). Ils ne les remplacent pas.
+#
+# IMPORTANT : mc_initial / price_change_m5 / tx_accel sont disponibles AU
+# MOMENT DE L'ALERTE (donnée DexScreener au moment de la détection), donc
+# ils filtrent AVANT l'envoi de l'alerte Telegram.
+#
+# buy_ratio_20s, en revanche, n'existe QU'APRÈS 20 secondes de suivi
+# post-alerte (calculé dans analyser_20_premieres_secondes). Il ne peut
+# donc PAS bloquer l'alerte elle-même — il sert de condition de
+# confirmation pour ouvrir une SIMULATION de position (SL/TP), une fois les
+# 20 premières secondes de trading écoulées.
+TRIGGER_MC_MIN = 20000
+TRIGGER_MC_MAX = 45000
+TRIGGER_PRICE_CHANGE_M5_MIN = 10
+TRIGGER_PRICE_CHANGE_M5_MAX = 50
+TRIGGER_TX_ACCEL_MIN = 1.2
+TRIGGER_BUY_RATIO_20S_MIN = 0.55
+
+
+def passe_filtres_triggers(market_cap, price_change_m5, tx_accel):
+    """
+    Filtre de "signal d'entrée" additionnel, appliqué avant l'alerte, en
+    complément des filtres de qualité existants (liquidité/RugCheck).
+    """
+    if market_cap is None or not (TRIGGER_MC_MIN <= market_cap <= TRIGGER_MC_MAX):
+        return False
+    if price_change_m5 is None or not (TRIGGER_PRICE_CHANGE_M5_MIN < price_change_m5 < TRIGGER_PRICE_CHANGE_M5_MAX):
+        return False
+    if tx_accel is None or tx_accel <= TRIGGER_TX_ACCEL_MIN:
+        return False
+    return True
+
+
+# ============================================================
+# --- SIMULATION SL/TP (AUCUN ORDRE RÉEL — TRACKING UNIQUEMENT) ---
+# ============================================================
+# Le bot n'a ni wallet ni intégration de swap : il n'achète ni ne vend
+# jamais réellement. Ce qui suit simule ce qui SE SERAIT PASSÉ si une
+# position avait été prise au prix observé à la fin des 20 premières
+# secondes (uniquement si le signal est validé, cf. TRIGGER_BUY_RATIO_20S_MIN
+# ci-dessus). Utile pour évaluer la stratégie a posteriori via le CSV.
+SIMULATION_SL_PCT = -0.25              # stop-loss initial : -25% du prix d'entrée simulé
+SIMULATION_TP1_MULT = 2.0              # take-profit 1 : x2 -> vend 50% (simulé), SL remonté au breakeven
+SIMULATION_TP2_MULT = 3.0              # take-profit 2 : x3 -> active un trailing stop sur le solde
+SIMULATION_TRAILING_APRES_TP2_PCT = -0.20  # trailing stop -20% sous le plus haut, sur le solde après TP2
+
+
+def gerer_simulation_position(mint, current_mc, elapsed_seconds):
+    """
+    Fait évoluer l'état d'une position SIMULÉE (aucun ordre réel) en
+    fonction du market cap courant. Appelée à chaque vérification de prix
+    (monitor_ath) pour les tokens dont le signal a été validé.
+    """
+    data = active_tokens.get(mint)
+    if not data or not current_mc:
+        return
+
+    statut = data.get("position_statut")
+    if statut not in ("ouverte", "tp1", "trailing"):
+        return  # pas de position simulée active (en attente, non validée, ou déjà clôturée)
+
+    entree = data.get("prix_entree_simule")
+    if not entree:
+        return
+    ratio = current_mc / entree
+
+    if statut == "ouverte":
+        if current_mc <= data["sl_prix_simule"]:
+            data["position_statut"] = "stop_loss"
+            data["resultat_pct_simule"] = round((data["sl_prix_simule"] / entree - 1) * 100, 2)
+            print(f"[simulation] {data['symbol']} — SL touché, position simulée clôturée ({SIMULATION_SL_PCT*100:.0f}%)")
+            return
+        if ratio >= SIMULATION_TP1_MULT:
+            data["tp1_atteint"] = True
+            data["time_to_2x"] = round(elapsed_seconds)
+            data["sl_prix_simule"] = entree  # SL remonté au breakeven sur le solde
+            data["position_statut"] = "tp1"
+            print(f"[simulation] {data['symbol']} — TP1 (x2) touché à {elapsed_seconds:.0f}s, 50% vendus (simulé), SL -> breakeven")
+
+    elif statut == "tp1":
+        if current_mc <= data["sl_prix_simule"]:
+            data["position_statut"] = "breakeven"
+            data["resultat_pct_simule"] = 0.0
+            print(f"[simulation] {data['symbol']} — Breakeven touché après TP1, solde clôturé (simulé)")
+            return
+        if ratio >= SIMULATION_TP2_MULT:
+            data["tp2_atteint"] = True
+            data["time_to_3x"] = round(elapsed_seconds)
+            data["position_statut"] = "trailing"
+            data["max_price_apres_tp2"] = current_mc
+            print(f"[simulation] {data['symbol']} — TP2 (x3) touché à {elapsed_seconds:.0f}s, trailing -20% activé (simulé)")
+
+    elif statut == "trailing":
+        if current_mc > data.get("max_price_apres_tp2", current_mc):
+            data["max_price_apres_tp2"] = current_mc
+        seuil_trailing = data["max_price_apres_tp2"] * (1 + SIMULATION_TRAILING_APRES_TP2_PCT)
+        if current_mc <= seuil_trailing:
+            data["position_statut"] = "trailing_stop"
+            data["resultat_pct_simule"] = round((current_mc / entree - 1) * 100, 2)
+            print(f"[simulation] {data['symbol']} — Trailing stop touché après TP2, solde clôturé (simulé)")
+
+
+# ============================================================
+# --- PRIX SOL/USD (pour convertir des volumes USD en équivalent SOL) ---
+# ============================================================
+_sol_price_cache = {"prix": None, "ts": 0}
+SOL_PRICE_CACHE_TTL = 300  # 5 minutes
+
+
+def get_sol_usd_price():
+    now = time.time()
+    if _sol_price_cache["prix"] and (now - _sol_price_cache["ts"]) < SOL_PRICE_CACHE_TTL:
+        return _sol_price_cache["prix"]
+    try:
+        url = "https://api.coingecko.com/api/v3/simple/price"
+        params = {"ids": "solana", "vs_currencies": "usd"}
+        res = requests.get(url, params=params, timeout=8)
+        if res.status_code == 200:
+            prix = res.json().get("solana", {}).get("usd")
+            if prix:
+                _sol_price_cache["prix"] = prix
+                _sol_price_cache["ts"] = now
+                return prix
+    except Exception as e:
+        print(f"[get_sol_usd_price] erreur : {e}")
+    return _sol_price_cache["prix"]  # dernier prix connu (ou None si jamais récupéré)
+
+
+# ============================================================
 # --- MODULE DEV CLUSTER : tracking de l'arbre de wallets ---
 # ============================================================
 #
@@ -62,10 +194,10 @@ ANALYSE_20S_DURATION = 20         # durée totale observée
 #     avec un historique plus long que ça peut avoir des tokens plus anciens
 #     non détectés.
 #   - L'identification du wallet "créateur" (dev) d'un mint utilise l'API
-#     publique de Pump.fun (frontend-api.pump.fun). Cet endpoint n'est PAS
-#     officiellement documenté et peut changer sans préavis — à vérifier/
-#     ajuster si ça casse en prod (teste avec un mint connu avant de
-#     déployer).
+#     publique de Pump.fun (frontend-api-v3.pump.fun). Cet endpoint n'est
+#     PAS officiellement documenté et peut changer sans préavis — à
+#     vérifier/ajuster si ça casse en prod (teste avec un mint connu avant
+#     de déployer).
 
 SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 
@@ -265,7 +397,13 @@ def get_pump_fun_creator(mint):
     """
     try:
         url = f"https://frontend-api-v3.pump.fun/coins-v2/{mint}"
-        res = requests.get(url, timeout=8, headers={"Accept": "application/json"})
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Referer": "https://pump.fun/",
+        }
+        res = requests.get(url, timeout=8, headers=headers)
         if res.status_code != 200:
             print(f"[pump_fun_creator] status={res.status_code} pour {mint}")
             return None
@@ -474,6 +612,13 @@ LOG_FIELDS = [
     "cluster_tokens_historiques", "cluster_mult_moyen", "cluster_mult_max", "cluster_mult_min",
     # --- colonnes boost DexScreener ---
     "boost_detecte", "nombre_boosts_actifs",
+    # --- colonnes vélocité/qualité des ordres (nouvelles) ---
+    "tx_velocity_5s", "buy_ratio_5s",
+    "avg_buy_size_sol", "avg_sell_size_sol",  # approximation : DexScreener ne sépare pas achats/ventes dans le volume
+    "unique_buyers_count",  # non disponible via DexScreener -> toujours vide (nécessiterait du parsing on-chain)
+    # --- colonnes simulation SL/TP (nouvelles) ---
+    "signal_valide", "position_statut", "resultat_pct_simule",
+    "time_to_2x", "time_to_3x", "max_drawdown_before_peak",
 ]
 
 
@@ -701,6 +846,7 @@ def analyser_20_premieres_secondes(mint):
     initial_mc = data.get("initial_mc") or 1.0
     start = data["start_time"]
     samples = []
+    dernier_mc_valide = None
 
     nb_mesures = max(int(ANALYSE_20S_DURATION / ANALYSE_20S_SAMPLE_INTERVAL), 1)
     for i in range(nb_mesures + 1):
@@ -710,6 +856,8 @@ def analyser_20_premieres_secondes(mint):
         buys_m5 = sells_m5 = None
         if pair:
             mc = pair.get("marketCap", 0) or pair.get("fdv", 0)
+            if mc:
+                dernier_mc_valide = mc
             txns_m5 = (pair.get("txns") or {}).get("m5") or {}
             buys_m5 = txns_m5.get("buys")
             sells_m5 = txns_m5.get("sells")
@@ -744,12 +892,19 @@ def analyser_20_premieres_secondes(mint):
         total_2s = premier_delta_achats + premier_delta_ventes
         buy_ratio_2s = round(premier_delta_achats / total_2s, 3) if total_2s > 0 else None
 
-    def _buy_ratio(fenetre_max_s):
-        achats_cumules = sum(da for _, e_fin, da, _ in deltas if e_fin <= fenetre_max_s)
-        ventes_cumulees = sum(dv for _, e_fin, _, dv in deltas if e_fin <= fenetre_max_s)
-        total = achats_cumules + ventes_cumulees
-        return round(achats_cumules / total, 3) if total else None
+    def _achats_ventes_cumules(fenetre_max_s):
+        achats = sum(da for _, e_fin, da, _ in deltas if e_fin <= fenetre_max_s)
+        ventes = sum(dv for _, e_fin, _, dv in deltas if e_fin <= fenetre_max_s)
+        return achats, ventes
 
+    def _buy_ratio(fenetre_max_s):
+        achats, ventes = _achats_ventes_cumules(fenetre_max_s)
+        total = achats + ventes
+        return round(achats / total, 3) if total else None
+
+    achats_5s, ventes_5s = _achats_ventes_cumules(5)
+    tx_velocity_5s = achats_5s + ventes_5s
+    buy_ratio_5s = round(achats_5s / tx_velocity_5s, 3) if tx_velocity_5s else None
     buy_ratio_10s = _buy_ratio(10)
     buy_ratio_20s = _buy_ratio(ANALYSE_20S_DURATION)
 
@@ -758,10 +913,32 @@ def analyser_20_premieres_secondes(mint):
         active_tokens[mint]["buy_ratio_20s"] = buy_ratio_20s
         active_tokens[mint]["achats_bruts_2s"] = achats_bruts_2s
         active_tokens[mint]["buy_ratio_2s"] = buy_ratio_2s
+        active_tokens[mint]["tx_velocity_5s"] = tx_velocity_5s
+        active_tokens[mint]["buy_ratio_5s"] = buy_ratio_5s
+
+        # --- Validation du signal + ouverture éventuelle de la simulation SL/TP ---
+        entry_stats = active_tokens[mint].get("entry_stats", {})
+        price_change_m5 = entry_stats.get("price_change_m5")
+        tx_accel = entry_stats.get("tx_accel")
+
+        signal_valide = (
+            buy_ratio_20s is not None and buy_ratio_20s >= TRIGGER_BUY_RATIO_20S_MIN
+            and passe_filtres_triggers(initial_mc, price_change_m5, tx_accel)
+        )
+        active_tokens[mint]["signal_valide"] = signal_valide
+
+        if signal_valide and dernier_mc_valide:
+            active_tokens[mint]["prix_entree_simule"] = dernier_mc_valide
+            active_tokens[mint]["sl_prix_simule"] = dernier_mc_valide * (1 + SIMULATION_SL_PCT)
+            active_tokens[mint]["position_statut"] = "ouverte"
+            print(f"[simulation] {data['symbol']} ({mint}) — signal validé, position simulée ouverte à ${dernier_mc_valide:,.0f}")
+        else:
+            active_tokens[mint]["position_statut"] = "signal_non_valide"
 
     print(
         f"[analyse_20s] {data['symbol']} ({mint}) — "
-        f"buy_ratio_2s={buy_ratio_2s} buy_ratio_10s={buy_ratio_10s} buy_ratio_20s={buy_ratio_20s} achats_bruts_2s={achats_bruts_2s}"
+        f"buy_ratio_2s={buy_ratio_2s} buy_ratio_5s={buy_ratio_5s} buy_ratio_10s={buy_ratio_10s} "
+        f"buy_ratio_20s={buy_ratio_20s} achats_bruts_2s={achats_bruts_2s}"
     )
 
 
@@ -782,6 +959,21 @@ def essayer_alerter(mint, pair, source_url):
         print(f"[filtré] {symbol} ({mint}) — MC=${market_cap:,.0f} Liq=${liquidity_usd:,.0f}")
         return False
 
+    # --- Calcul anticipé de price_change_m5 / tx_accel pour le filtre de trigger ---
+    txns = pair.get("txns") or {}
+    volume = pair.get("volume") or {}
+    txns_m5 = txns.get("m5") or {}
+    txns_h1 = txns.get("h1") or {}
+    price_change_m5 = (pair.get("priceChange") or {}).get("m5")
+
+    tot_m5 = (txns_m5.get("buys") or 0) + (txns_m5.get("sells") or 0)
+    tot_h1 = (txns_h1.get("buys") or 0) + (txns_h1.get("sells") or 0)
+    tx_accel = round((tot_m5 * 12) / tot_h1, 3) if tot_h1 > 0 else None
+
+    if not passe_filtres_triggers(market_cap, price_change_m5, tx_accel):
+        print(f"[trigger] {symbol} ({mint}) rejeté — MC=${market_cap:,.0f} price_change_m5={price_change_m5} tx_accel={tx_accel}")
+        return False
+
     rug_ok, rug_score, rug_flags, top10_pct, insiders_detected, lp_locked_pct, total_holders, bundle_detected = rugcheck_verdict(mint)
     if not rug_ok:
         print(f"[rugcheck] {symbol} ({mint}) rejeté — score={rug_score} flags={rug_flags} top10={top10_pct}")
@@ -795,29 +987,32 @@ def essayer_alerter(mint, pair, source_url):
         except (TypeError, ValueError):
             pool_age_seconds = None
 
-    txns = pair.get("txns") or {}
-    volume = pair.get("volume") or {}
-    txns_m5 = txns.get("m5") or {}
-    txns_h1 = txns.get("h1") or {}
-    price_change_m5 = (pair.get("priceChange") or {}).get("m5")
-
-    tot_m5 = (txns_m5.get("buys") or 0) + (txns_m5.get("sells") or 0)
-    tot_h1 = (txns_h1.get("buys") or 0) + (txns_h1.get("sells") or 0)
-    tx_accel = round((tot_m5 * 12) / tot_h1, 3) if tot_h1 > 0 else None
-
     # --- Détection boost DexScreener ---
     boost_detecte, nombre_boosts_actifs = extraire_infos_boost(pair)
+
+    # --- Taille moyenne des ordres (approximation, cf. limitation ci-dessous) ---
+    # DexScreener ne distingue PAS le volume acheteur du volume vendeur : on ne
+    # peut donc calculer qu'une taille d'ordre MOYENNE globale, appliquée aux
+    # deux colonnes achat/vente faute de meilleure donnée disponible.
+    sol_price = get_sol_usd_price()
+    volume_m5 = volume.get("m5")
+    avg_order_size_sol = None
+    if volume_m5 and tot_m5 and sol_price:
+        avg_order_size_usd = volume_m5 / tot_m5
+        avg_order_size_sol = round(avg_order_size_usd / sol_price, 4)
 
     entry_stats = {
         "liquidity_ratio": round(liquidity_usd / market_cap, 4) if market_cap else None,
         "txns_buys_m5": txns_m5.get("buys"),
         "txns_sells_m5": txns_m5.get("sells"),
-        "volume_m5": volume.get("m5"),
+        "volume_m5": volume_m5,
         "txns_buys_h1": txns_h1.get("buys"),
         "txns_sells_h1": txns_h1.get("sells"),
         "volume_h1": volume.get("h1"),
         "price_change_m5": price_change_m5,
         "tx_accel": tx_accel,
+        "avg_buy_size_sol": avg_order_size_sol,
+        "avg_sell_size_sol": avg_order_size_sol,
     }
 
     flags_txt = ", ".join(rug_flags) if rug_flags else "Aucun"
@@ -850,6 +1045,7 @@ def essayer_alerter(mint, pair, source_url):
         "dex": dex_name,
         "initial_mc": market_cap or 1.0,
         "max_price": market_cap or 1.0,
+        "min_price": market_cap or 1.0,
         "liquidity_usd": liquidity_usd,
         "rugcheck_score": rug_score,
         "rugcheck_flags": flags_txt,
@@ -877,6 +1073,19 @@ def essayer_alerter(mint, pair, source_url):
         "cluster_mult_moyen": None,
         "cluster_mult_max": None,
         "cluster_mult_min": None,
+        # champs simulation SL/TP (remplis après les 20 premières secondes)
+        "signal_valide": None,
+        "position_statut": "analyse_20s_en_cours",
+        "prix_entree_simule": None,
+        "sl_prix_simule": None,
+        "tp1_atteint": False,
+        "tp2_atteint": False,
+        "max_price_apres_tp2": None,
+        "resultat_pct_simule": None,
+        "time_to_2x": None,
+        "time_to_3x": None,
+        "tx_velocity_5s": None,
+        "buy_ratio_5s": None,
     }
     seen_mints.add(mint)
 
@@ -983,6 +1192,8 @@ def monitor_ath():
                         print(f"[monitor_ath] {data['symbol']} ({mint}) MC actuel=${current_mc:,.0f} (max enregistré=${data['max_price']:,.0f})")
                         if current_mc and current_mc > data["max_price"]:
                             active_tokens[mint]["max_price"] = current_mc
+                        if current_mc and current_mc < active_tokens[mint].get("min_price", current_mc):
+                            active_tokens[mint]["min_price"] = current_mc
 
                         # Le boost peut apparaître après l'alerte initiale :
                         # on met à jour le statut à chaque vérification prix
@@ -994,6 +1205,10 @@ def monitor_ath():
                             active_tokens[mint]["nombre_boosts_actifs"] = max(
                                 nb_boosts_maj, active_tokens[mint].get("nombre_boosts_actifs", 0) or 0
                             )
+
+                        # --- Simulation SL/TP (aucun ordre réel, tracking seulement) ---
+                        if current_mc:
+                            gerer_simulation_position(mint, current_mc, elapsed)
                     else:
                         print(f"[monitor_ath] {data['symbol']} ({mint}) aucune pair retournée par DexScreener")
                 else:
@@ -1018,6 +1233,23 @@ def monitor_ath():
                 if data.get("boost_detecte") else "Non"
             )
 
+            # --- Finalisation de la simulation SL/TP si jamais clôturée ---
+            if data.get("signal_valide") and data.get("resultat_pct_simule") is None:
+                entree = data.get("prix_entree_simule") or initial_mc
+                active_tokens[mint]["resultat_pct_simule"] = round((max_mc / entree - 1) * 100, 2)
+                if data.get("position_statut") in ("ouverte", "tp1", "trailing"):
+                    active_tokens[mint]["position_statut"] = "expire_30min"
+                data = active_tokens[mint]
+
+            if data.get("signal_valide"):
+                resultat_txt = (
+                    f"{data.get('resultat_pct_simule', 0):+.1f}%"
+                    if data.get("resultat_pct_simule") is not None else "N/A"
+                )
+                simulation_txt = f"🎯 Signal validé — Résultat simulé : {resultat_txt} (statut: {data.get('position_statut')})\n"
+            else:
+                simulation_txt = "🎯 Signal non validé par les triggers (pas de simulation)\n"
+
             msg_rapport = (
                 f"📋 *Rapport 30 min*\n\n"
                 f"🪙 Token : {data['symbol']}\n"
@@ -1025,6 +1257,7 @@ def monitor_ath():
                 f"🏆 Market Cap max atteint : ${max_mc:,.0f}\n"
                 f"✖️ Multiplicateur : x{multiplicateur:,.2f}\n"
                 f"🚀 Boosté : {boost_txt_rapport}\n"
+                f"{simulation_txt}"
                 f"🔗 [Voir sur DexScreener]({dex_url})\n"
                 f"⚡ [Trader sur Axiom](https://axiom.trade/meme/{mint})"
             )
@@ -1032,6 +1265,10 @@ def monitor_ath():
             print(f"Rapport 30 min envoyé pour : {data['symbol']} — x{multiplicateur:,.2f}")
 
             entry_stats = data.get("entry_stats", {})
+
+            min_price = data.get("min_price", initial_mc)
+            max_drawdown_before_peak = round((min_price / initial_mc - 1) * 100, 2) if initial_mc else None
+
             log_resultat_csv({
                 "horodatage": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "mint": mint,
@@ -1076,6 +1313,19 @@ def monitor_ath():
                 # --- stats boost DexScreener ---
                 "boost_detecte": data.get("boost_detecte", False),
                 "nombre_boosts_actifs": data.get("nombre_boosts_actifs", 0),
+                # --- vélocité / qualité des ordres ---
+                "tx_velocity_5s": data.get("tx_velocity_5s"),
+                "buy_ratio_5s": data.get("buy_ratio_5s"),
+                "avg_buy_size_sol": entry_stats.get("avg_buy_size_sol"),
+                "avg_sell_size_sol": entry_stats.get("avg_sell_size_sol"),
+                "unique_buyers_count": None,  # non disponible via DexScreener
+                # --- simulation SL/TP ---
+                "signal_valide": data.get("signal_valide"),
+                "position_statut": data.get("position_statut"),
+                "resultat_pct_simule": data.get("resultat_pct_simule"),
+                "time_to_2x": data.get("time_to_2x"),
+                "time_to_3x": data.get("time_to_3x"),
+                "max_drawdown_before_peak": max_drawdown_before_peak,
             })
 
             tokens_to_remove.append(mint)
