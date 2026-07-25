@@ -388,6 +388,37 @@ def explorer_arbre_aval(wallet, profondeur_restante, wallets_deja_vus):
     return resultat
 
 
+def explorer_chaine_amont(wallet, profondeur_restante, wallets_deja_vus):
+    """
+    Remonte récursivement la chaîne de FINANCEMENT (qui a payé le gas de
+    qui) jusqu'à MAX_DEPTH niveaux en amont, symétriquement à
+    explorer_arbre_aval qui descend l'arbre de distribution. Chaque wallet
+    de la chaîne est ajouté à wallets_deja_vus pour éviter les boucles et
+    les doublons avec l'exploration en aval.
+    Retourne une liste de dicts {"wallet":..., "montant_recu":..., "niveau":...}
+    où "niveau" est une chaîne du type "amont-1", "amont-2", etc.
+    """
+    resultat = []
+    if profondeur_restante < 0 or len(wallets_deja_vus) >= CLUSTER_MAX_WALLETS:
+        return resultat
+
+    financeur, montant, _, _ = trouver_wallet_financeur(wallet)
+    if not financeur or financeur in wallets_deja_vus:
+        return resultat
+
+    wallets_deja_vus.add(financeur)
+    niveau_num = MAX_DEPTH - profondeur_restante
+    resultat.append({
+        "wallet": financeur,
+        "montant_recu": round(montant, 3) if montant else None,
+        "niveau": f"amont-{niveau_num}",
+    })
+    if profondeur_restante > 0:
+        resultat.extend(explorer_chaine_amont(financeur, profondeur_restante - 1, wallets_deja_vus))
+
+    return resultat
+
+
 def get_pump_fun_creator(mint):
     """
     Récupère l'adresse du wallet créateur (dev) d'un token via l'API
@@ -503,11 +534,24 @@ def analyser_dev_cluster(mint, dev_wallet):
         try:
             print(f"[cluster] début exploration pour dev={dev_wallet} (token {mint})")
 
-            financeur, montant_financeur, _, _ = trouver_wallet_financeur(dev_wallet)
-
             wallets_vus = {dev_wallet}
+
+            # Exploration en aval (qui le dev a financé) ET en amont (qui a
+            # financé le dev, et ainsi de suite), sur la même profondeur
+            # MAX_DEPTH des deux côtés. wallets_vus est partagé pour éviter
+            # qu'un même wallet soit exploré deux fois (ex: si un wallet
+            # amont est aussi un destinataire aval d'un autre sous-wallet).
             arbre_aval = explorer_arbre_aval(dev_wallet, MAX_DEPTH - 1, wallets_vus)
-            tous_les_wallets = [dev_wallet] + [w["wallet"] for w in arbre_aval]
+            chaine_amont = explorer_chaine_amont(dev_wallet, MAX_DEPTH - 1, wallets_vus)
+
+            financeur = chaine_amont[0]["wallet"] if chaine_amont else None
+            montant_financeur = chaine_amont[0]["montant_recu"] if chaine_amont else None
+
+            tous_les_wallets = (
+                [dev_wallet]
+                + [w["wallet"] for w in arbre_aval]
+                + [w["wallet"] for w in chaine_amont]
+            )
 
             tous_les_mints = []
             for w in tous_les_wallets:
@@ -548,6 +592,16 @@ def analyser_dev_cluster(mint, dev_wallet):
             if not sous_wallets_txt:
                 sous_wallets_txt = "   Aucun détecté\n"
 
+            amont_txt = ""
+            for w in chaine_amont[:8]:
+                addr = w["wallet"]
+                montant_txt = f"{w['montant_recu']} SOL" if w["montant_recu"] else "montant inconnu"
+                amont_txt += f"   • `{addr[:4]}...{addr[-4:]}` ({montant_txt}, {w['niveau']})\n"
+            if len(chaine_amont) > 8:
+                amont_txt += f"   … et {len(chaine_amont) - 8} autre(s)\n"
+            if not amont_txt:
+                amont_txt = "   Aucun détecté\n"
+
             stats_txt = "Aucun token historique détecté (best-effort, historique limité)"
             if multiplicateurs:
                 stats_txt = (
@@ -559,9 +613,11 @@ def analyser_dev_cluster(mint, dev_wallet):
                 f"🕵️ *Analyse Dev Cluster*\n\n"
                 f"👤 Wallet dev : `{dev_wallet[:4]}...{dev_wallet[-4:]}`\n"
                 f"💰 Financé par : {financeur_txt}{financeur_montant_txt}\n\n"
-                f"📊 Sous-wallets détectés : {len(arbre_aval)}\n"
+                f"🔺 Chaîne de financement en amont : {len(chaine_amont)}\n"
+                f"{amont_txt}\n"
+                f"📊 Sous-wallets détectés (aval) : {len(arbre_aval)}\n"
                 f"{sous_wallets_txt}\n"
-                f"📈 Historique du cluster : {stats_txt}\n\n"
+                f"📈 Historique du cluster ({len(tous_les_wallets)} wallet(s) analysés) : {stats_txt}\n\n"
                 f"🔗 [Voir le wallet dev sur Solscan](https://solscan.io/account/{dev_wallet})"
             )
             send_telegram_message(msg)
