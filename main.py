@@ -29,8 +29,9 @@ PENDING_MAX_AGE = 24 * 3600  # 24h
 # mais ne garantissent JAMAIS qu'un token est fiable. Aucun filtre
 # automatique ne protège d'un rug pull.
 MIN_LIQUIDITY_USD = 5000      # liquidité minimum sur le pool
-MIN_MARKET_CAP = 20000        # market cap / FDV minimum
-MIN_LIQUIDITY_RATIO = 0.03    # liquidité doit représenter au moins 3% du market cap
+MIN_LIQUIDITY_RATIO = 0.03    # liquidité doit représenter au moins 3% du market cap (si market cap connu)
+# MIN_MARKET_CAP a été retiré : le bot ne filtre plus par Market Cap, tous
+# les tokens sont traités sans exception, quel que soit leur Market Cap.
 
 # Un token pump.fun reste sur "pumpfun" (bonding curve) tant qu'il n'a pas
 # gradué. Une fois la bonding curve terminée (migration), il apparaît sur
@@ -60,8 +61,8 @@ ANALYSE_20S_DURATION = 20         # durée totale observée
 # donc PAS bloquer l'alerte elle-même — il sert de condition de
 # confirmation pour ouvrir une SIMULATION de position (SL/TP), une fois les
 # 20 premières secondes de trading écoulées.
-TRIGGER_MC_MIN = 20000
-TRIGGER_MC_MAX = 45000
+# TRIGGER_MC_MIN / TRIGGER_MC_MAX ont été retirés : plus aucun filtre de
+# Market Cap n'est appliqué, ni en filtre de qualité ni en filtre de trigger.
 TRIGGER_PRICE_CHANGE_M5_MIN = 10
 TRIGGER_PRICE_CHANGE_M5_MAX = 50
 TRIGGER_TX_ACCEL_MIN = 1.2
@@ -72,9 +73,10 @@ def passe_filtres_triggers(market_cap, price_change_m5, tx_accel):
     """
     Filtre de "signal d'entrée" additionnel, appliqué avant l'alerte, en
     complément des filtres de qualité existants (liquidité/RugCheck).
+    NOTE : le filtre de Market Cap (TRIGGER_MC_MIN/TRIGGER_MC_MAX) a été
+    retiré à la demande de l'utilisateur — tous les tokens sont traités
+    sans exception, quel que soit leur Market Cap.
     """
-    if market_cap is None or not (TRIGGER_MC_MIN <= market_cap <= TRIGGER_MC_MAX):
-        return False
     if price_change_m5 is None or not (TRIGGER_PRICE_CHANGE_M5_MIN < price_change_m5 < TRIGGER_PRICE_CHANGE_M5_MAX):
         return False
     if tx_accel is None or tx_accel <= TRIGGER_TX_ACCEL_MIN:
@@ -94,6 +96,16 @@ SIMULATION_SL_PCT = -0.25              # stop-loss initial : -25% du prix d'entr
 SIMULATION_TP1_MULT = 2.0              # take-profit 1 : x2 -> vend 50% (simulé), SL remonté au breakeven
 SIMULATION_TP2_MULT = 3.0              # take-profit 2 : x3 -> active un trailing stop sur le solde
 SIMULATION_TRAILING_APRES_TP2_PCT = -0.20  # trailing stop -20% sous le plus haut, sur le solde après TP2
+
+# --- LIMITE DE TEMPS CONDITIONNELLE (Time-based Exit) ---
+# Si une position simulée reste "ouverte" (aucun SL, aucun TP1 déclenché)
+# plus de MAX_HOLD_TIME_MINUTES ET que le prix reste dans une fourchette
+# neutre par rapport au prix d'entrée, on clôture automatiquement 100% de
+# la position au marché (vente simulée, aucun ordre réel à annuler puisque
+# le bot ne passe jamais d'ordre réel).
+MAX_HOLD_TIME_MINUTES = 60             # durée max avant d'envisager une sortie sur temps
+TIME_EXIT_RATIO_MIN = 1 + (-0.10)      # borne basse de la fourchette neutre : -10% du prix d'entrée
+TIME_EXIT_RATIO_MAX = 1 + 0.20         # borne haute de la fourchette neutre : +20% du prix d'entrée
 
 
 def gerer_simulation_position(mint, current_mc, elapsed_seconds):
@@ -127,6 +139,20 @@ def gerer_simulation_position(mint, current_mc, elapsed_seconds):
             data["sl_prix_simule"] = entree  # SL remonté au breakeven sur le solde
             data["position_statut"] = "tp1"
             print(f"[simulation] {data['symbol']} — TP1 (x2) touché à {elapsed_seconds:.0f}s, 50% vendus (simulé), SL -> breakeven")
+            return
+
+        # --- Time-based Exit : ni SL ni TP1 déclenché à ce stade ---
+        entry_time = data.get("entry_time")
+        if entry_time and MAX_HOLD_TIME_MINUTES:
+            hold_minutes = (time.time() - entry_time) / 60
+            if hold_minutes >= MAX_HOLD_TIME_MINUTES and TIME_EXIT_RATIO_MIN <= ratio <= TIME_EXIT_RATIO_MAX:
+                data["position_statut"] = "time_exit"
+                data["resultat_pct_simule"] = round((ratio - 1) * 100, 2)
+                print(
+                    f"[simulation] {data['symbol']} — Time-based Exit après {hold_minutes:.0f} min "
+                    f"(prix neutre, {(ratio - 1) * 100:+.1f}%), 100% vendus (simulé), ordres associés annulés"
+                )
+                return
 
     elif statut == "tp1":
         if current_mc <= data["sl_prix_simule"]:
@@ -747,13 +773,11 @@ def extraire_infos_profil(pair):
 
 
 def passe_les_filtres(market_cap, liquidity_usd):
-    if not market_cap or not liquidity_usd:
+    if not liquidity_usd:
         return False
     if liquidity_usd < MIN_LIQUIDITY_USD:
         return False
-    if market_cap < MIN_MARKET_CAP:
-        return False
-    if (liquidity_usd / market_cap) < MIN_LIQUIDITY_RATIO:
+    if market_cap and (liquidity_usd / market_cap) < MIN_LIQUIDITY_RATIO:
         return False
     return True
 
@@ -1029,6 +1053,7 @@ def analyser_20_premieres_secondes(mint):
             active_tokens[mint]["prix_entree_simule"] = dernier_mc_valide
             active_tokens[mint]["sl_prix_simule"] = dernier_mc_valide * (1 + SIMULATION_SL_PCT)
             active_tokens[mint]["position_statut"] = "ouverte"
+            active_tokens[mint]["entry_time"] = time.time()  # horodatage exact de l'achat simulé, pour le Time-based Exit
             print(f"[simulation] {data['symbol']} ({mint}) — signal validé, position simulée ouverte à ${dernier_mc_valide:,.0f}")
         else:
             active_tokens[mint]["position_statut"] = "signal_non_valide"
@@ -1187,6 +1212,7 @@ def essayer_alerter(mint, pair, source_url):
         "position_statut": "analyse_20s_en_cours",
         "prix_entree_simule": None,
         "sl_prix_simule": None,
+        "entry_time": None,  # horodatage exact de l'achat simulé, utilisé par le Time-based Exit
         "tp1_atteint": False,
         "tp2_atteint": False,
         "max_price_apres_tp2": None,
