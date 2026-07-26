@@ -108,14 +108,13 @@ TIME_EXIT_RATIO_MIN = 1 + (-0.10)      # borne basse de la fourchette neutre : -
 TIME_EXIT_RATIO_MAX = 1 + 0.20         # borne haute de la fourchette neutre : +20% du prix d'entrée
 
 # ============================================================
-# --- PARAMÈTRES PROPOSÉS (NON CÂBLÉS DANS LA LOGIQUE) ---
+# --- PARAMÈTRES D'OPTIMISATION (analyse token_log4 à token_log9) ---
 # ============================================================
-# Les constantes ci-dessous correspondent aux 4 points d'optimisation
-# discutés (analyse token_log4 à token_log8). Elles sont ajoutées ici pour
-# être disponibles/modifiables, mais ne sont PAS encore utilisées par
-# gerer_simulation_position(), analyser_20_premieres_secondes() ou
-# essayer_alerter() : aucun comportement du bot n'est modifié tant que ces
-# paramètres ne sont pas explicitement câblés dans le code.
+# Statut par point :
+#   1. TP1 partiel + Trailing Stop dès +20%  -> NON câblé (constantes prêtes)
+#   2. Fallback NaN sur buy_ratio_20s        -> CÂBLÉ (voir analyser_20_premieres_secondes)
+#   3. Fenêtre d'âge de pool idéale          -> NON câblé (constantes prêtes)
+#   4. Bonus crédibilité (profil + boost)    -> NON câblé (constantes prêtes)
 
 # --- 1. TP1 partiel + Trailing Stop dès +20% (à câbler dans
 #     gerer_simulation_position, en remplacement/complément de
@@ -124,12 +123,12 @@ TP1_PARTIAL_GAIN_PCT = 0.35            # gain déclenchant le TP1 partiel (35% �
 TP1_PARTIAL_SELL_RATIO = 0.5           # part de la position vendue au TP1 (50%)
 TRAILING_ACTIVATION_GAIN_PCT = 0.20    # gain à partir duquel le SL est remonté au breakeven (+20%)
 
-# --- 2. Fallback NaN sur buy_ratio_20s / buy_ratio_5s (à câbler dans
+# --- 2. Fallback NaN sur buy_ratio_20s (câblé dans
 #     analyser_20_premieres_secondes, avant le calcul de signal_valide) ---
-FALLBACK_BUY_RATIO_ENABLED = True      # active le fallback si buy_ratio_20s/5s est None
+FALLBACK_BUY_RATIO_ENABLED = True      # active le fallback si buy_ratio_20s est None
 FALLBACK_BUY_RATIO_MIN = 0.55          # seuil appliqué au ratio de repli (achats_m5 / (achats_m5+ventes_m5))
 # NOTE : ce ratio de repli est mesuré sur une fenêtre différente (activité
-# de marché AVANT/à l'alerte, via DexScreener) de buy_ratio_20s/5s (mesurés
+# de marché AVANT/à l'alerte, via DexScreener) de buy_ratio_20s (mesuré
 # APRÈS l'alerte, par polling direct) — ce n'est qu'un proxy, pas une
 # donnée strictement équivalente.
 
@@ -741,7 +740,7 @@ LOG_FIELDS = [
     "avg_buy_size_sol", "avg_sell_size_sol",  # approximation : DexScreener ne sépare pas achats/ventes dans le volume
     "unique_buyers_count",  # non disponible via DexScreener -> toujours vide (nécessiterait du parsing on-chain)
     # --- colonnes simulation SL/TP (nouvelles) ---
-    "signal_valide", "position_statut", "resultat_pct_simule",
+    "signal_valide", "buy_ratio_source", "position_statut", "resultat_pct_simule",
     "time_to_2x", "time_to_3x", "max_drawdown_before_peak",
 ]
 
@@ -1080,11 +1079,36 @@ def analyser_20_premieres_secondes(mint):
         price_change_m5 = entry_stats.get("price_change_m5")
         tx_accel = entry_stats.get("tx_accel")
 
+        # Ratio buy/sell utilisé pour la validation du signal : buy_ratio_20s
+        # en priorité (mesuré après l'alerte, sur les 20 premières secondes
+        # de trading). S'il est absent (NaN — ex: DexScreener a renvoyé une
+        # valeur nulle sur au moins une des mesures, rendant les deltas
+        # incalculables), on bascule sur un ratio de repli calculé à partir
+        # des transactions m5 déjà connues à l'alerte (achats_m5/ventes_m5) :
+        # ce n'est pas la même fenêtre temporelle que buy_ratio_20s, mais ça
+        # évite de rejeter automatiquement un token valide à cause d'un bug
+        # de collecte de données plutôt qu'un vrai signal faible.
+        ratio_utilise = buy_ratio_20s
+        ratio_source = "buy_ratio_20s"
+        if ratio_utilise is None and FALLBACK_BUY_RATIO_ENABLED:
+            achats_m5 = entry_stats.get("txns_buys_m5")
+            ventes_m5 = entry_stats.get("txns_sells_m5")
+            if achats_m5 is not None and ventes_m5 is not None and (achats_m5 + ventes_m5) > 0:
+                ratio_utilise = round(achats_m5 / (achats_m5 + ventes_m5), 3)
+                ratio_source = "fallback_m5"
+        if ratio_utilise is None:
+            ratio_source = "aucune_donnee"  # ni buy_ratio_20s ni fallback m5 n'étaient exploitables
+
+        seuil_ratio = FALLBACK_BUY_RATIO_MIN if ratio_source == "fallback_m5" else TRIGGER_BUY_RATIO_20S_MIN
+
         signal_valide = (
-            buy_ratio_20s is not None and buy_ratio_20s >= TRIGGER_BUY_RATIO_20S_MIN
+            ratio_utilise is not None and ratio_utilise >= seuil_ratio
             and passe_filtres_triggers(initial_mc, price_change_m5, tx_accel)
         )
         active_tokens[mint]["signal_valide"] = signal_valide
+        active_tokens[mint]["buy_ratio_source"] = ratio_source  # persiste la donnée pour le CSV (étape 1/3)
+        if ratio_source == "fallback_m5":
+            print(f"[simulation] {data['symbol']} ({mint}) — buy_ratio_20s absent, fallback_m5 utilisé = {ratio_utilise}")
 
         if signal_valide and dernier_mc_valide:
             active_tokens[mint]["prix_entree_simule"] = dernier_mc_valide
@@ -1246,6 +1270,7 @@ def essayer_alerter(mint, pair, source_url):
         "cluster_mult_min": None,
         # champs simulation SL/TP (remplis après les 20 premières secondes)
         "signal_valide": None,
+        "buy_ratio_source": None,  # "buy_ratio_20s" | "fallback_m5" | "aucune_donnee"
         "position_statut": "analyse_20s_en_cours",
         "prix_entree_simule": None,
         "sl_prix_simule": None,
@@ -1507,6 +1532,7 @@ def monitor_ath():
                 "unique_buyers_count": None,  # non disponible via DexScreener
                 # --- simulation SL/TP ---
                 "signal_valide": data.get("signal_valide"),
+                "buy_ratio_source": data.get("buy_ratio_source"),
                 "position_statut": data.get("position_statut"),
                 "resultat_pct_simule": data.get("resultat_pct_simule"),
                 "time_to_2x": data.get("time_to_2x"),
