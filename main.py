@@ -107,6 +107,43 @@ MAX_HOLD_TIME_MINUTES = 60             # durée max avant d'envisager une sortie
 TIME_EXIT_RATIO_MIN = 1 + (-0.10)      # borne basse de la fourchette neutre : -10% du prix d'entrée
 TIME_EXIT_RATIO_MAX = 1 + 0.20         # borne haute de la fourchette neutre : +20% du prix d'entrée
 
+# ============================================================
+# --- PARAMÈTRES PROPOSÉS (NON CÂBLÉS DANS LA LOGIQUE) ---
+# ============================================================
+# Les constantes ci-dessous correspondent aux 4 points d'optimisation
+# discutés (analyse token_log4 à token_log8). Elles sont ajoutées ici pour
+# être disponibles/modifiables, mais ne sont PAS encore utilisées par
+# gerer_simulation_position(), analyser_20_premieres_secondes() ou
+# essayer_alerter() : aucun comportement du bot n'est modifié tant que ces
+# paramètres ne sont pas explicitement câblés dans le code.
+
+# --- 1. TP1 partiel + Trailing Stop dès +20% (à câbler dans
+#     gerer_simulation_position, en remplacement/complément de
+#     SIMULATION_TP1_MULT et SIMULATION_TRAILING_APRES_TP2_PCT) ---
+TP1_PARTIAL_GAIN_PCT = 0.35            # gain déclenchant le TP1 partiel (35% — à arbitrer entre 0.35 et 0.50)
+TP1_PARTIAL_SELL_RATIO = 0.5           # part de la position vendue au TP1 (50%)
+TRAILING_ACTIVATION_GAIN_PCT = 0.20    # gain à partir duquel le SL est remonté au breakeven (+20%)
+
+# --- 2. Fallback NaN sur buy_ratio_20s / buy_ratio_5s (à câbler dans
+#     analyser_20_premieres_secondes, avant le calcul de signal_valide) ---
+FALLBACK_BUY_RATIO_ENABLED = True      # active le fallback si buy_ratio_20s/5s est None
+FALLBACK_BUY_RATIO_MIN = 0.55          # seuil appliqué au ratio de repli (achats_m5 / (achats_m5+ventes_m5))
+# NOTE : ce ratio de repli est mesuré sur une fenêtre différente (activité
+# de marché AVANT/à l'alerte, via DexScreener) de buy_ratio_20s/5s (mesurés
+# APRÈS l'alerte, par polling direct) — ce n'est qu'un proxy, pas une
+# donnée strictement équivalente.
+
+# --- 3. Fenêtre d'âge de pool idéale (à câbler dans essayer_alerter ou
+#     passe_filtres_triggers, en filtre strict ou en scoring pondéré) ---
+POOL_AGE_IDEAL_MAX_SECONDS = 600       # fenêtre d'opportunité "pool jeune" (< 600s)
+POOL_AGE_STRICT_FILTER = False         # False = scoring pondéré (recommandé), True = rejet strict au-delà du seuil
+
+# --- 4. Bonus de score pour profil DexScreener + boost combinés (à câbler
+#     dans essayer_alerter, en assouplissement des seuils micro-structure
+#     quand ce bonus est actif) ---
+CREDIBILITY_BONUS_ENABLED = True       # active le bonus profil + boost
+CREDIBILITY_BONUS_REQUIRES_BOTH = True # bonus décisif seulement si profil ET boost sont vrais simultanément
+
 
 def gerer_simulation_position(mint, current_mc, elapsed_seconds):
     """
