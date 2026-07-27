@@ -316,6 +316,8 @@ LOG_FIELDS = [
     "ratio_liquidite_mc", "sell_ratio_1m", "max_tx_per_second",
     # -- D. Suivi temporel --
     "pool_age_minutes", "is_golden_window", "time_to_peak",
+    # -- E. Vitesse / timing de la chute (nouvelles colonnes) --
+    "time_to_max_drawdown", "vitesse_chute_pct_par_min",
     # ============================================================
     # --- Simulations des stratégies de sortie (benchmark, mise 100$) ---
     # ============================================================
@@ -547,6 +549,56 @@ def get_true_ath_mc(pool_address, initial_mc, initial_price, start_time, ohlcv_l
 
 
 # ============================================================
+# --- VITESSE / TIMING DE LA CHUTE (nouvelles colonnes) ---
+# ============================================================
+# max_drawdown_before_peak donne DEJA la profondeur de la pire baisse avant
+# le pic, mais pas QUAND ni A QUELLE VITESSE elle s'est produite. Ces deux
+# fonctions calculent, à partir des bougies minute GeckoTerminal (la même
+# trajectoire déjà récupérée pour get_true_ath_mc et
+# simuler_strategies_sortie — aucun appel réseau supplémentaire), l'instant
+# du point le plus bas et la vitesse de chute correspondante. Purement
+# informatif : n'influence jamais signal_valide ni position_statut.
+def calculer_timing_drawdown(ohlcv_list, prix_initial, start_time, min_price_fallback, min_price_time_fallback):
+    """
+    Retourne (time_to_max_drawdown_secondes, vitesse_chute_pct_par_min).
+    Cherche le plus bas ("low") le plus profond dans les bougies minute
+    GeckoTerminal (précision à la minute). Si aucune bougie exploitable
+    n'est disponible, retombe sur le suivi par polling du bot
+    (min_price/min_price_time, précision ~2 minutes, voire meilleure pour
+    les 20 premières secondes/3 premières minutes — cf. min_price_time mis
+    à jour dans analyser_20_premieres_secondes/analyser_metriques_etendues/
+    monitor_ath).
+    """
+    time_to_dd = None
+    prix_au_plus_bas = None
+
+    if ohlcv_list and prix_initial:
+        try:
+            bougies = sorted(ohlcv_list, key=lambda c: c[0])
+            candidate = min(
+                (c for c in bougies if len(c) >= 4 and c[3]),
+                key=lambda c: c[3],
+                default=None,
+            )
+            if candidate:
+                time_to_dd = max(round(candidate[0] - start_time), 0)
+                prix_au_plus_bas = candidate[3]
+        except (TypeError, ValueError, IndexError):
+            time_to_dd = None
+            prix_au_plus_bas = None
+
+    if time_to_dd is None:
+        # Repli sur le suivi par polling du bot (moins précis, mais toujours disponible)
+        time_to_dd = min_price_time_fallback
+
+    # max_drawdown_before_peak est calculé séparément (min_price/initial_mc,
+    # cf. monitor_ath) : on ne le recalcule pas ici pour rester cohérent
+    # avec la colonne existante, on se contente de dater le point bas.
+    minutes_ecoulees = (time_to_dd or 0) / 60
+    return time_to_dd, minutes_ecoulees
+
+
+# ============================================================
 # --- SIMULATIONS DE STRATÉGIES DE SORTIE (benchmark, a posteriori) ---
 # ============================================================
 # Ces simulations sont purement informatives : elles tournent APRÈS coup
@@ -759,12 +811,10 @@ def fetch_pair_data(mint):
 # ============================================================
 # La fonction ci-dessous (analyser_20_premieres_secondes) calcule
 # signal_valide et pilote l'ouverture de la position simulée. Elle est
-# restée STRICTEMENT IDENTIQUE à la version précédente du bot : aucune
-# ligne de cette fonction n'a été ajoutée, retirée ou modifiée dans cette
-# mise à jour. Les nouvelles métriques (section suivante,
-# analyser_metriques_etendues) sont calculées par un thread entièrement
-# SÉPARÉ et INDÉPENDANT, démarré depuis essayer_alerter, qui ne lit ni
-# n'écrit aucune donnée utilisée par cette fonction.
+# restée STRICTEMENT IDENTIQUE à la version précédente du bot pour toute
+# sa logique de décision : la SEULE addition est la mise à jour de
+# min_price/min_price_time (nouveau, pour dater la chute), qui ne modifie
+# ni ne lit aucune variable utilisée par signal_valide/position_statut.
 def analyser_20_premieres_secondes(mint):
     data = active_tokens.get(mint)
     if not data:
@@ -798,6 +848,11 @@ def analyser_20_premieres_secondes(mint):
         if mint in active_tokens:
             active_tokens[mint]["low_second_20s"] = low_second
             active_tokens[mint]["low_mult_20s"] = round(low_mult, 3)
+            # Met à jour le plus bas global (et son horodatage) si ce point
+            # des 20 premières secondes est plus bas que ce qui est connu.
+            if low_mc < active_tokens[mint].get("min_price", low_mc):
+                active_tokens[mint]["min_price"] = low_mc
+                active_tokens[mint]["min_price_time"] = low_second
         print(f"[analyse_20s] {data['symbol']} ({mint}) — point le plus bas à {low_second}s (x{low_mult:,.2f})")
     else:
         print(f"[analyse_20s] aucune donnée de market cap exploitable pour {mint}")
@@ -901,7 +956,9 @@ def analyser_20_premieres_secondes(mint):
 # dans son propre thread depuis essayer_alerter. Cette fonction ne lit et
 # n'écrit JAMAIS les champs utilisés par signal_valide / position_statut /
 # gerer_simulation_position : elle se contente d'ajouter des colonnes
-# supplémentaires (reporting) sur le token déjà alerté.
+# supplémentaires (reporting) sur le token déjà alerté. La mise à jour de
+# min_price/min_price_time (pour dater la chute) est la seule addition
+# partagée avec le reste du bot, en lecture/écriture non bloquante.
 METRIQUES_ETENDUES_DUREE = 180          # 3 minutes suivies pour les métriques élargies
 METRIQUES_ETENDUES_INTERVAL = 5         # secondes entre 2 mesures
 
@@ -932,6 +989,13 @@ def analyser_metriques_etendues(mint):
             sells_m5 = txns_m5.get("sells")
             volume_m5 = (pair.get("volume") or {}).get("m5")
         samples.append((elapsed, mc, price_usd, buys_m5, sells_m5, volume_m5))
+
+        # Met à jour le plus bas global (et son horodatage) en direct, dès
+        # qu'un point plus bas que le minimum connu est observé.
+        if mc and mint in active_tokens and mc < active_tokens[mint].get("min_price", mc):
+            active_tokens[mint]["min_price"] = mc
+            active_tokens[mint]["min_price_time"] = elapsed
+
         prochain_t += METRIQUES_ETENDUES_INTERVAL
         if mint not in active_tokens:
             return  # le token a été retiré (rapport déjà envoyé) -> on arrête l'échantillonnage
@@ -1143,6 +1207,7 @@ def essayer_alerter(mint, pair, source_url):
         "max_price": market_cap or 1.0,
         "max_price_time": 0,  # horodatage (secondes écoulées depuis l'alerte) du dernier max observé -> time_to_peak
         "min_price": market_cap or 1.0,
+        "min_price_time": 0,  # horodatage (secondes écoulées depuis l'alerte) du plus bas observé -> time_to_max_drawdown
         "liquidity_usd": liquidity_usd,
         "rugcheck_score": rug_score,
         "rugcheck_flags": flags_txt,
@@ -1306,6 +1371,7 @@ def monitor_ath():
                             active_tokens[mint]["max_price_time"] = round(elapsed)
                         if current_mc and current_mc < active_tokens[mint].get("min_price", current_mc):
                             active_tokens[mint]["min_price"] = current_mc
+                            active_tokens[mint]["min_price_time"] = round(elapsed)
 
                         # Le boost peut apparaître après l'alerte initiale :
                         # on met à jour le statut à chaque vérification prix
@@ -1342,9 +1408,9 @@ def monitor_ath():
             pool_address = data.get("pool_address")
 
             # Un seul appel GeckoTerminal (bougies minute), réutilisé à la
-            # fois pour l'ATH réel et pour les simulations de stratégies de
-            # sortie (simuler_strategies_sortie), plutôt que deux appels
-            # séparés comme dans une version précédente.
+            # fois pour l'ATH réel, les simulations de stratégies de sortie
+            # (simuler_strategies_sortie), et le timing de la chute
+            # (calculer_timing_drawdown), plutôt que plusieurs appels séparés.
             elapsed_minutes = max(int(elapsed / 60) + 5, 10)
             ohlcv_list = fetch_ohlcv_minute(pool_address, elapsed_minutes)
 
@@ -1420,6 +1486,21 @@ def monitor_ath():
 
             # --- Simulations de stratégies de sortie (benchmark, mise 100$) ---
             simulations_sortie = simuler_strategies_sortie(ohlcv_list, data.get("initial_price"))
+
+            # --- Vitesse / timing de la chute (nouvelles colonnes) ---
+            time_to_max_drawdown, minutes_ecoulees_dd = calculer_timing_drawdown(
+                ohlcv_list, data.get("initial_price"), data["start_time"],
+                min_price, data.get("min_price_time", 0),
+            )
+            vitesse_chute_pct_par_min = None
+            if max_drawdown_before_peak is not None and minutes_ecoulees_dd and minutes_ecoulees_dd > 0:
+                vitesse_chute_pct_par_min = round(max_drawdown_before_peak / minutes_ecoulees_dd, 2)
+            elif max_drawdown_before_peak == 0:
+                vitesse_chute_pct_par_min = 0.0
+            # Si minutes_ecoulees_dd == 0 alors que max_drawdown_before_peak < 0,
+            # la chute a eu lieu quasi instantanément (à la 1ère seconde
+            # observée) : la vitesse n'est pas calculable proprement (division
+            # par ~0), on laisse None plutôt que d'afficher un nombre absurde.
 
             log_resultat_csv({
                 "horodatage": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1498,6 +1579,9 @@ def monitor_ath():
                 "pool_age_minutes": pool_age_minutes,
                 "is_golden_window": is_golden_window,
                 "time_to_peak": temps_pic,
+                # --- E. vitesse / timing de la chute ---
+                "time_to_max_drawdown": time_to_max_drawdown,
+                "vitesse_chute_pct_par_min": vitesse_chute_pct_par_min,
                 # --- simulations stratégies de sortie ---
                 **simulations_sortie,
             })
