@@ -55,26 +55,6 @@ ANALYSE_20S_DURATION = 20         # durée totale observée
 # ============================================================
 # --- FILTRES DE TRIGGER (signal d'entrée optimisé) ---
 # ============================================================
-# Ces critères s'ajoutent AUX filtres de qualité ci-dessus (liquidité,
-# RugCheck...). Ils ne les remplacent pas.
-#
-# IMPORTANT : mc_initial / price_change_m5 / tx_accel sont disponibles AU
-# MOMENT DE L'ALERTE (donnée DexScreener au moment de la détection), donc
-# ils filtrent AVANT l'envoi de l'alerte Telegram.
-#
-# buy_ratio_20s, en revanche, n'existe QU'APRÈS 20 secondes de suivi
-# post-alerte (calculé dans analyser_20_premieres_secondes). Il ne peut
-# donc PAS bloquer l'alerte elle-même — il sert de condition de
-# confirmation pour ouvrir une SIMULATION de position (SL/TP), une fois les
-# 20 premières secondes de trading écoulées.
-# TRIGGER_MC_MIN / TRIGGER_MC_MAX ont été retirés : plus aucun filtre de
-# Market Cap n'est appliqué, ni en filtre de qualité ni en filtre de trigger.
-#
-# ⚠️ CETTE SECTION (ainsi que analyser_20_premieres_secondes et
-# gerer_simulation_position plus bas) constitue la logique de décision
-# d'achat du bot (signal_valide). Elle n'a PAS été modifiée lors de cette
-# mise à jour : seules des colonnes/statistiques supplémentaires ont été
-# ajoutées ailleurs dans le script, sans jamais influencer ces filtres.
 TRIGGER_PRICE_CHANGE_M5_MIN = 10
 TRIGGER_PRICE_CHANGE_M5_MAX = 50
 TRIGGER_TX_ACCEL_MIN = 1.2
@@ -82,13 +62,6 @@ TRIGGER_BUY_RATIO_20S_MIN = 0.55
 
 
 def passe_filtres_triggers(market_cap, price_change_m5, tx_accel):
-    """
-    Filtre de "signal d'entrée" additionnel, appliqué avant l'alerte, en
-    complément des filtres de qualité existants (liquidité/RugCheck).
-    NOTE : le filtre de Market Cap (TRIGGER_MC_MIN/TRIGGER_MC_MAX) a été
-    retiré à la demande de l'utilisateur — tous les tokens sont traités
-    sans exception, quel que soit leur Market Cap.
-    """
     if price_change_m5 is None or not (TRIGGER_PRICE_CHANGE_M5_MIN < price_change_m5 < TRIGGER_PRICE_CHANGE_M5_MAX):
         return False
     if tx_accel is None or tx_accel <= TRIGGER_TX_ACCEL_MIN:
@@ -96,90 +69,39 @@ def passe_filtres_triggers(market_cap, price_change_m5, tx_accel):
     return True
 
 
-# ============================================================
-# --- SIMULATION SL/TP (AUCUN ORDRE RÉEL — TRACKING UNIQUEMENT) ---
-# ============================================================
-# Le bot n'a ni wallet ni intégration de swap : il n'achète ni ne vend
-# jamais réellement. Ce qui suit simule ce qui SE SERAIT PASSÉ si une
-# position avait été prise au prix observé à la fin des 20 premières
-# secondes (uniquement si le signal est validé, cf. TRIGGER_BUY_RATIO_20S_MIN
-# ci-dessus). Utile pour évaluer la stratégie a posteriori via le CSV.
-# Cette simulation "position_statut" est indépendante des simulations de
-# STRATÉGIES DE SORTIE (sim_remb, sim_ts20, sim_ts30, sim_3paliers,
-# sim_ts_immediat, sim_peak) ajoutées plus bas dans ce fichier : celles-ci
-# sont calculées a posteriori sur la bougie GeckoTerminal complète du
-# trade, uniquement pour comparer des stratégies de sortie entre elles, et
-# n'influencent jamais non plus la décision d'achat.
-SIMULATION_SL_PCT = -0.25              # stop-loss initial : -25% du prix d'entrée simulé
-SIMULATION_TP1_MULT = 2.0              # take-profit 1 : x2 -> vend 50% (simulé), SL remonté au breakeven
-SIMULATION_TP2_MULT = 3.0              # take-profit 2 : x3 -> active un trailing stop sur le solde
-SIMULATION_TRAILING_APRES_TP2_PCT = -0.20  # trailing stop -20% sous le plus haut, sur le solde après TP2
+SIMULATION_SL_PCT = -0.25
+SIMULATION_TP1_MULT = 2.0
+SIMULATION_TP2_MULT = 3.0
+SIMULATION_TRAILING_APRES_TP2_PCT = -0.20
 
-# --- LIMITE DE TEMPS CONDITIONNELLE (Time-based Exit) ---
-# Si une position simulée reste "ouverte" (aucun SL, aucun TP1 déclenché)
-# plus de MAX_HOLD_TIME_MINUTES ET que le prix reste dans une fourchette
-# neutre par rapport au prix d'entrée, on clôture automatiquement 100% de
-# la position au marché (vente simulée, aucun ordre réel à annuler puisque
-# le bot ne passe jamais d'ordre réel).
-MAX_HOLD_TIME_MINUTES = 60             # durée max avant d'envisager une sortie sur temps
-TIME_EXIT_RATIO_MIN = 1 + (-0.10)      # borne basse de la fourchette neutre : -10% du prix d'entrée
-TIME_EXIT_RATIO_MAX = 1 + 0.20         # borne haute de la fourchette neutre : +20% du prix d'entrée
+MAX_HOLD_TIME_MINUTES = 60
+TIME_EXIT_RATIO_MIN = 1 + (-0.10)
+TIME_EXIT_RATIO_MAX = 1 + 0.20
 
-# ============================================================
-# --- PARAMÈTRES D'OPTIMISATION (analyse token_log4 à token_log9) ---
-# ============================================================
-# Statut par point :
-#   1. TP1 partiel + Trailing Stop dès +20%  -> NON câblé (constantes prêtes)
-#   2. Fallback NaN sur buy_ratio_20s        -> CÂBLÉ (voir analyser_20_premieres_secondes)
-#   3. Fenêtre d'âge de pool idéale          -> NON câblé (constantes prêtes)
-#   4. Bonus crédibilité (profil + boost)    -> NON câblé (constantes prêtes)
+TP1_PARTIAL_GAIN_PCT = 0.35
+TP1_PARTIAL_SELL_RATIO = 0.5
+TRAILING_ACTIVATION_GAIN_PCT = 0.20
 
-# --- 1. TP1 partiel + Trailing Stop dès +20% (à câbler dans
-#     gerer_simulation_position, en remplacement/complément de
-#     SIMULATION_TP1_MULT et SIMULATION_TRAILING_APRES_TP2_PCT) ---
-TP1_PARTIAL_GAIN_PCT = 0.35            # gain déclenchant le TP1 partiel (35% — à arbitrer entre 0.35 et 0.50)
-TP1_PARTIAL_SELL_RATIO = 0.5           # part de la position vendue au TP1 (50%)
-TRAILING_ACTIVATION_GAIN_PCT = 0.20    # gain à partir duquel le SL est remonté au breakeven (+20%)
+FALLBACK_BUY_RATIO_ENABLED = True
+FALLBACK_BUY_RATIO_MIN = 0.55
 
-# --- 2. Fallback NaN sur buy_ratio_20s (câblé dans
-#     analyser_20_premieres_secondes, avant le calcul de signal_valide) ---
-FALLBACK_BUY_RATIO_ENABLED = True      # active le fallback si buy_ratio_20s est None
-FALLBACK_BUY_RATIO_MIN = 0.55          # seuil appliqué au ratio de repli (achats_m5 / (achats_m5+ventes_m5))
-# NOTE : ce ratio de repli est mesuré sur une fenêtre différente (activité
-# de marché AVANT/à l'alerte, via DexScreener) de buy_ratio_20s (mesuré
-# APRÈS l'alerte, par polling direct) — ce n'est qu'un proxy, pas une
-# donnée strictement équivalente.
+POOL_AGE_IDEAL_MAX_SECONDS = 600
+POOL_AGE_STRICT_FILTER = False
 
-# --- 3. Fenêtre d'âge de pool idéale (à câbler dans essayer_alerter ou
-#     passe_filtres_triggers, en filtre strict ou en scoring pondéré) ---
-POOL_AGE_IDEAL_MAX_SECONDS = 600       # fenêtre d'opportunité "pool jeune" (< 600s)
-POOL_AGE_STRICT_FILTER = False         # False = scoring pondéré (recommandé), True = rejet strict au-delà du seuil
+CREDIBILITY_BONUS_ENABLED = True
+CREDIBILITY_BONUS_REQUIRES_BOTH = True
 
-# --- 4. Bonus de score pour profil DexScreener + boost combinés (à câbler
-#     dans essayer_alerter, en assouplissement des seuils micro-structure
-#     quand ce bonus est actif) ---
-CREDIBILITY_BONUS_ENABLED = True       # active le bonus profil + boost
-CREDIBILITY_BONUS_REQUIRES_BOTH = True # bonus décisif seulement si profil ET boost sont vrais simultanément
-
-# --- Fenêtre "golden window" utilisée UNIQUEMENT pour la colonne CSV
-# informative is_golden_window (aucun lien avec POOL_AGE_IDEAL_MAX_SECONDS
-# ci-dessus, qui reste un paramètre non câblé réservé au scoring futur). ---
-GOLDEN_WINDOW_MAX_SECONDS = 420        # 7 minutes
+GOLDEN_WINDOW_MAX_SECONDS = 420
 
 
 def gerer_simulation_position(mint, current_mc, elapsed_seconds):
-    """
-    Fait évoluer l'état d'une position SIMULÉE (aucun ordre réel) en
-    fonction du market cap courant. Appelée à chaque vérification de prix
-    (monitor_ath) pour les tokens dont le signal a été validé.
-    """
     data = active_tokens.get(mint)
     if not data or not current_mc:
         return
 
     statut = data.get("position_statut")
     if statut not in ("ouverte", "tp1", "trailing"):
-        return  # pas de position simulée active (en attente, non validée, ou déjà clôturée)
+        return
 
     entree = data.get("prix_entree_simule")
     if not entree:
@@ -195,12 +117,11 @@ def gerer_simulation_position(mint, current_mc, elapsed_seconds):
         if ratio >= SIMULATION_TP1_MULT:
             data["tp1_atteint"] = True
             data["time_to_2x"] = round(elapsed_seconds)
-            data["sl_prix_simule"] = entree  # SL remonté au breakeven sur le solde
+            data["sl_prix_simule"] = entree
             data["position_statut"] = "tp1"
             print(f"[simulation] {data['symbol']} — TP1 (x2) touché à {elapsed_seconds:.0f}s, 50% vendus (simulé), SL -> breakeven")
             return
 
-        # --- Time-based Exit : ni SL ni TP1 déclenché à ce stade ---
         entry_time = data.get("entry_time")
         if entry_time and MAX_HOLD_TIME_MINUTES:
             hold_minutes = (time.time() - entry_time) / 60
@@ -236,11 +157,8 @@ def gerer_simulation_position(mint, current_mc, elapsed_seconds):
             print(f"[simulation] {data['symbol']} — Trailing stop touché après TP2, solde clôturé (simulé)")
 
 
-# ============================================================
-# --- PRIX SOL/USD (pour convertir des volumes USD en équivalent SOL) ---
-# ============================================================
 _sol_price_cache = {"prix": None, "ts": 0}
-SOL_PRICE_CACHE_TTL = 300  # 5 minutes
+SOL_PRICE_CACHE_TTL = 300
 
 
 def get_sol_usd_price():
@@ -259,7 +177,7 @@ def get_sol_usd_price():
                 return prix
     except Exception as e:
         print(f"[get_sol_usd_price] erreur : {e}")
-    return _sol_price_cache["prix"]  # dernier prix connu (ou None si jamais récupéré)
+    return _sol_price_cache["prix"]
 
 
 LOG_FILE = "token_log.csv"
@@ -276,38 +194,23 @@ LOG_FIELDS = [
     "seconde_prix_plus_bas_20s", "multiplicateur_plus_bas_20s",
     "buy_ratio_10s", "buy_ratio_20s", "achats_bruts_2s",
     "price_change_m5", "tx_accel", "buy_ratio_2s",
-    # --- colonnes boost DexScreener ---
     "boost_detecte", "nombre_boosts_actifs",
-    # --- colonnes profil DexScreener ---
     "profil_dexscreener", "site_web", "twitter", "telegram",
-    # --- colonnes vélocité/qualité des ordres ---
     "tx_velocity_5s", "buy_ratio_5s",
-    "avg_order_size_sol",  # taille moyenne d'un ordre (achat+vente confondus, DexScreener ne les sépare pas)
-    "unique_buyers_count",  # non disponible via DexScreener -> toujours vide (nécessiterait du parsing on-chain)
-    "buy_ratio_diag",  # diagnostic : pourquoi buy_ratio_10s/20s est vide (ok / pair_introuvable / aucune_activite_detectee)
-    # --- colonnes simulation SL/TP (position d'entrée simulée) ---
+    "avg_order_size_sol",
+    "unique_buyers_count",
+    "buy_ratio_diag",
     "signal_valide", "buy_ratio_source", "position_statut", "resultat_pct_simule",
     "time_to_2x", "time_to_3x", "max_drawdown_before_peak",
-    # ============================================================
-    # --- NOUVELLES COLONNES (métriques étendues) ---
-    # ============================================================
-    # -- A. Fenêtres temporelles courtes (10s & 1 minute) --
     "achats_10s", "ventes_10s",
     "volume_m1", "ratio_volume_m1_m5",
     "price_change_m1", "price_change_m3",
     "buy_ratio_1m", "achats_m1", "ratio_achats_m1_m5",
     "buy_tx_ratio_m5",
-    # -- B. Trajectoire du multiplicateur --
     "mult_10s", "mult_30s", "mult_1m",
-    # -- C. Métriques acheteurs, liquidité & squeeze --
     "ratio_liquidite_mc", "sell_ratio_1m", "max_tx_per_second",
-    # -- D. Suivi temporel --
     "pool_age_minutes", "is_golden_window", "time_to_peak",
-    # -- E. Vitesse / timing de la chute (nouvelles colonnes) --
     "time_to_max_drawdown", "vitesse_chute_pct_par_min",
-    # ============================================================
-    # --- Simulations des stratégies de sortie (benchmark, mise 100$) ---
-    # ============================================================
     "sim_remb_pct", "sim_remb_usd",
     "sim_ts20_pct", "sim_ts20_usd",
     "sim_ts30_pct", "sim_ts30_usd",
@@ -318,12 +221,6 @@ LOG_FIELDS = [
 
 
 def log_resultat_csv(row):
-    """
-    Ajoute une ligne au CSV de log, en créant l'en-tête si besoin.
-    Anti-doublon : si le mint a déjà été journalisé une fois dans ce
-    processus (présent dans tokens_traites), la ligne est ignorée pour
-    éviter d'enregistrer deux fois le même token dans le CSV.
-    """
     mint = row.get("mint")
     if mint and mint in tokens_traites:
         print(f"[log_resultat_csv] {mint} déjà journalisé précédemment — doublon ignoré")
@@ -349,9 +246,6 @@ def _to_float(value):
 
 
 def _safe_div(numerateur, denominateur, defaut=0):
-    """Division sécurisée : retourne `defaut` (0 par défaut) si le
-    dénominateur est None, nul, ou si numérateur/dénominateur sont
-    invalides — utilisée par toutes les nouvelles métriques ratio."""
     try:
         if not denominateur:
             return defaut
@@ -361,11 +255,6 @@ def _safe_div(numerateur, denominateur, defaut=0):
 
 
 def extraire_infos_boost(pair):
-    """
-    Extrait les infos de boost DexScreener d'une pair. DexScreener renvoie
-    un champ "boosts": {"active": N} quand le token a des boosts payants
-    actifs (mise en avant sur leur plateforme). Retourne (bool, int).
-    """
     boosts_info = pair.get("boosts") or {}
     nombre_boosts_actifs = boosts_info.get("active", 0) or 0
     boost_detecte = nombre_boosts_actifs > 0
@@ -373,15 +262,6 @@ def extraire_infos_boost(pair):
 
 
 def extraire_infos_profil(pair):
-    """
-    Extrait les infos de "profil" DexScreener d'une pair : site web et
-    réseaux sociaux (Twitter/X, Telegram, etc.). Sur DexScreener, un token
-    qui a un profil rempli (souvent payant / signal d'effort marketing du
-    projet) a un champ "info" non vide, avec des sous-listes "websites" et
-    "socials".
-    Retourne (a_un_profil: bool, site_web: str|None, twitter: str|None,
-    telegram: str|None).
-    """
     info = pair.get("info") or {}
     websites = info.get("websites") or []
     socials = info.get("socials") or []
@@ -485,16 +365,6 @@ def rugcheck_verdict(mint):
 
 
 def fetch_ohlcv_minute(pool_address, minutes_limit):
-    """
-    Récupère jusqu'à `minutes_limit` bougies minute (OHLCV, en USD) depuis
-    GeckoTerminal pour un pool donné. Retourne la liste brute
-    [[timestamp, open, high, low, close, volume], ...] (ordre du plus
-    récent au plus ancien, tel que renvoyé par l'API), ou None en cas
-    d'échec. Utilisée à la fois pour le calcul de l'ATH réel
-    (get_true_ath_mc) et pour les simulations de stratégies de sortie
-    (simuler_strategies_sortie), afin de ne faire qu'un seul appel réseau
-    pour les deux usages.
-    """
     if not pool_address:
         return None
     try:
@@ -512,12 +382,6 @@ def fetch_ohlcv_minute(pool_address, minutes_limit):
 
 
 def get_true_ath_mc(pool_address, initial_mc, initial_price, start_time, ohlcv_list=None):
-    """
-    Calcule le vrai market cap ATH à partir des bougies minute GeckoTerminal.
-    Si `ohlcv_list` est déjà disponible (récupéré une fois via
-    fetch_ohlcv_minute), on la réutilise pour éviter un appel réseau en
-    double ; sinon on la récupère ici.
-    """
     if not pool_address or not initial_price:
         return None
     try:
@@ -535,9 +399,6 @@ def get_true_ath_mc(pool_address, initial_mc, initial_price, start_time, ohlcv_l
         return None
 
 
-# ============================================================
-# --- VITESSE / TIMING DE LA CHUTE (nouvelles colonnes) ---
-# ============================================================
 def calculer_timing_drawdown(ohlcv_list, prix_initial, start_time, min_price_fallback, min_price_time_fallback):
     time_to_dd = None
     prix_au_plus_bas = None
@@ -564,9 +425,6 @@ def calculer_timing_drawdown(ohlcv_list, prix_initial, start_time, min_price_fal
     return time_to_dd, minutes_ecoulees
 
 
-# ============================================================
-# --- SIMULATIONS DE STRATÉGIES DE SORTIE (benchmark, a posteriori) ---
-# ============================================================
 MISE_SIMULATION_USD = 100
 SIMU_TRAILING_TECH_B_PCT = -0.20
 SIMU_TRAILING_TECH_C_PCT = -0.30
@@ -733,29 +591,7 @@ def fetch_pair_data(mint):
         return None
 
 
-# ============================================================
-# --- FALLBACK : TRANSACTIONS RÉELLES VIA GECKOTERMINAL /trades ---
-# ============================================================
-# Le calcul principal de buy_ratio_10s/20s repose sur un DELTA du compteur
-# agrégé DexScreener (txns.m5.buys/sells), rafraîchi toutes les
-# ANALYSE_20S_SAMPLE_INTERVAL secondes. Deux cas le rendent inexploitable :
-#   - la pair n'est pas encore indexée par DexScreener juste après la
-#     migration (buy_ratio_diag = "pair_introuvable") ;
-#   - le compteur agrégé ne bouge pas entre deux polls, alors que des
-#     trades ont bien eu lieu (buy_ratio_diag = "aucune_activite_detectee").
-# Dans ces deux cas UNIQUEMENT, on interroge l'endpoint /trades de
-# GeckoTerminal, qui renvoie les transactions individuelles réelles
-# (type buy/sell + timestamp exact), pour recalculer les ratios sur les
-# mêmes fenêtres (2s/5s/10s/20s). Quand le diagnostic est "ok", ce fallback
-# n'est jamais appelé : le calcul DexScreener reste la méthode principale.
 def fetch_geckoterminal_trades(pool_address):
-    """
-    Récupère les transactions individuelles réelles (les plus récentes,
-    jusqu'à ~300 selon l'API) via l'endpoint /trades de GeckoTerminal pour
-    un pool donné. Retourne une liste de tuples (timestamp_unix, kind) où
-    kind vaut "buy" ou "sell", triée du plus ancien au plus récent, ou
-    None en cas d'échec / réponse vide.
-    """
     if not pool_address:
         return None
     try:
@@ -785,12 +621,6 @@ def fetch_geckoterminal_trades(pool_address):
 
 
 def _buy_ratio_depuis_trades(trades, start_time, fenetre_max_s):
-    """
-    Calcule (buy_ratio, achats, ventes) sur la fenêtre
-    [start_time, start_time + fenetre_max_s], à partir d'une liste de
-    trades réels (timestamp, kind) obtenue via fetch_geckoterminal_trades.
-    Retourne (None, 0, 0) si aucun trade dans la fenêtre.
-    """
     if not trades:
         return None, 0, 0
     achats = ventes = 0
@@ -809,12 +639,6 @@ def _buy_ratio_depuis_trades(trades, start_time, fenetre_max_s):
 
 
 def calculer_buy_ratios_fallback_gecko(mint, pool_address, start_time):
-    """
-    Tente de recalculer buy_ratio_2s/5s/10s/20s (+ achats_bruts_2s et
-    tx_velocity_5s) à partir des trades réels GeckoTerminal. Retourne un
-    dict avec ces valeurs et un flag "reussi" (bool). N'écrit rien dans
-    active_tokens : c'est à l'appelant de décider quoi faire du résultat.
-    """
     resultat_vide = {
         "reussi": False,
         "buy_ratio_2s": None, "achats_bruts_2s": None,
@@ -887,9 +711,6 @@ def analyser_20_premieres_secondes(mint):
     echecs_pair = 0
     for (e_prev, mc_prev, b_prev, s_prev), (e_next, mc_next, b_next, s_next) in zip(samples, samples[1:]):
         if None in (b_prev, s_prev, b_next, s_next):
-            # b/s valent None quand fetch_pair_data n'a rien renvoyé (pair pas
-            # encore indexée par DexScreener) ou quand la pair existait mais
-            # sans champ txns.m5 exploitable à cet instant précis.
             echecs_pair += 1
             continue
         delta_achats = max(b_next - b_prev, 0)
@@ -927,10 +748,6 @@ def analyser_20_premieres_secondes(mint):
     buy_ratio_10s = _buy_ratio(10)
     buy_ratio_20s = _buy_ratio(ANALYSE_20S_DURATION)
 
-    # --- Fallback GeckoTerminal /trades : uniquement si le calcul
-    # DexScreener ci-dessus a échoué (diag != "ok"). Le calcul DexScreener
-    # reste la méthode principale et n'est jamais écrasé quand il a
-    # fonctionné. ---
     if buy_ratio_diag != "ok":
         pool_address = data.get("pool_address")
         fallback = calculer_buy_ratios_fallback_gecko(mint, pool_address, start)
@@ -1329,6 +1146,69 @@ def check_new_solana_tokens():
 
     except Exception as e:
         print(f"Erreur lors de la vérification DexScreener : {e}")
+
+
+# ============================================================
+# --- TOKENS BOOSTÉS DEXSCREENER (quel que soit leur âge) ---
+# ============================================================
+# Contrairement à /token-profiles/latest/v1 (derniers PROFILS remplis,
+# indépendant des boosts), ces deux endpoints listent les tokens BOOSTÉS :
+#   - /token-boosts/latest/v1 : les boosts les plus récents
+#   - /token-boosts/top/v1    : les tokens avec le plus de boosts actifs
+#     en ce moment (inclut des tokens boostés il y a plus longtemps, tant
+#     que leur boost est toujours actif -> c'est ce qui permet de capter
+#     "quel que soit leur âge", indépendamment du flux "latest").
+# On combine les deux pour maximiser la couverture, dédoublonné par mint.
+BOOSTED_ENDPOINTS = (
+    "https://api.dexscreener.com/token-boosts/latest/v1",
+    "https://api.dexscreener.com/token-boosts/top/v1",
+)
+
+
+def check_boosted_tokens():
+    mints_vus_ce_cycle = set()
+
+    for url in BOOSTED_ENDPOINTS:
+        try:
+            response = requests.get(url, timeout=10)
+            print(f"[debug_boosts] {url} status={response.status_code}")
+            if response.status_code != 200:
+                continue
+
+            data = response.json()
+            boosts = data if isinstance(data, list) else data.get("data", [])
+            print(f"[debug_boosts] {len(boosts)} tokens boostés reçus depuis {url}")
+
+            for boost in boosts:
+                if not boost or boost.get("chainId") != "solana":
+                    continue
+
+                mint = boost.get("tokenAddress")
+                if not mint or mint in mints_vus_ce_cycle:
+                    continue
+                mints_vus_ce_cycle.add(mint)
+
+                # Même logique de dédoublonnage que pour les profils : on
+                # ignore ce qui est déjà alerté, déjà en attente de
+                # migration, ou déjà en cours de suivi ATH.
+                if mint in seen_mints or mint in pending_mints or mint in active_tokens:
+                    continue
+
+                pair = fetch_pair_data(mint)
+                source_url = boost.get("url", f"https://dexscreener.com/solana/{mint}")
+
+                if not pair or pair.get("dexId") not in DEX_MIGRES:
+                    # Pas encore migré -> on le place en attente comme pour
+                    # les profils : check_pending_tokens() le retentera
+                    # ensuite jusqu'à PENDING_MAX_AGE (24h), quel que soit
+                    # son âge au moment où on l'a repéré comme boosté.
+                    pending_mints[mint] = time.time()
+                    continue
+
+                essayer_alerter(mint, pair, source_url)
+
+        except Exception as e:
+            print(f"Erreur lors de la vérification des tokens boostés ({url}) : {e}")
 
 
 PENDING_CHECK_INTERVAL = 30
@@ -1922,11 +1802,25 @@ def monitor_dextools_ath():
         cloturer_suivi_dextools(mint)
 
 
+BOOSTED_CHECK_INTERVAL = 30
+_last_boosted_check = 0
+
+
+def check_boosted_tokens_throttled():
+    global _last_boosted_check
+    now = time.time()
+    if (now - _last_boosted_check) < BOOSTED_CHECK_INTERVAL:
+        return
+    _last_boosted_check = now
+    check_boosted_tokens()
+
+
 if __name__ == "__main__":
     print("Bot de surveillance démarré...")
     while True:
         check_telegram_commands()
         check_new_solana_tokens()
+        check_boosted_tokens_throttled()
         check_pending_tokens()
         monitor_ath()
         check_dextools_channel_throttled()
