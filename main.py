@@ -262,20 +262,6 @@ def get_sol_usd_price():
     return _sol_price_cache["prix"]  # dernier prix connu (ou None si jamais récupéré)
 
 
-# ============================================================
-# --- (Module Dev Cluster retiré) ---
-# ============================================================
-# L'ancien module d'analyse de l'arbre de wallets du développeur (remontée
-# du financeur, descente des sous-wallets, détection des tokens créés par
-# le dev via l'API non-officielle Pump.fun...) a été supprimé : il
-# reposait sur le RPC public Solana et renvoyait très majoritairement des
-# données vides/incomplètes en pratique, pour un coût CPU/réseau élevé
-# (jusqu'à CLUSTER_MAX_WALLETS wallets explorés, chacun nécessitant
-# plusieurs appels RPC). Toutes les colonnes CSV "cluster_*" ont également
-# été retirées de LOG_FIELDS. Le reste du pipeline (alerte, filtres,
-# simulation SL/TP, rapport 30 min) est inchangé.
-
-
 LOG_FILE = "token_log.csv"
 LOG_FIELDS = [
     "horodatage", "mint", "symbole", "dex",
@@ -296,8 +282,9 @@ LOG_FIELDS = [
     "profil_dexscreener", "site_web", "twitter", "telegram",
     # --- colonnes vélocité/qualité des ordres ---
     "tx_velocity_5s", "buy_ratio_5s",
-    "avg_buy_size_sol", "avg_sell_size_sol",  # approximation : DexScreener ne sépare pas achats/ventes dans le volume
+    "avg_order_size_sol",  # taille moyenne d'un ordre (achat+vente confondus, DexScreener ne les sépare pas)
     "unique_buyers_count",  # non disponible via DexScreener -> toujours vide (nécessiterait du parsing on-chain)
+    "buy_ratio_diag",  # diagnostic : pourquoi buy_ratio_10s/20s est vide (ok / pair_introuvable / aucune_activite_detectee)
     # --- colonnes simulation SL/TP (position d'entrée simulée) ---
     "signal_valide", "buy_ratio_source", "position_statut", "resultat_pct_simule",
     "time_to_2x", "time_to_3x", "max_drawdown_before_peak",
@@ -551,24 +538,7 @@ def get_true_ath_mc(pool_address, initial_mc, initial_price, start_time, ohlcv_l
 # ============================================================
 # --- VITESSE / TIMING DE LA CHUTE (nouvelles colonnes) ---
 # ============================================================
-# max_drawdown_before_peak donne DEJA la profondeur de la pire baisse avant
-# le pic, mais pas QUAND ni A QUELLE VITESSE elle s'est produite. Ces deux
-# fonctions calculent, à partir des bougies minute GeckoTerminal (la même
-# trajectoire déjà récupérée pour get_true_ath_mc et
-# simuler_strategies_sortie — aucun appel réseau supplémentaire), l'instant
-# du point le plus bas et la vitesse de chute correspondante. Purement
-# informatif : n'influence jamais signal_valide ni position_statut.
 def calculer_timing_drawdown(ohlcv_list, prix_initial, start_time, min_price_fallback, min_price_time_fallback):
-    """
-    Retourne (time_to_max_drawdown_secondes, vitesse_chute_pct_par_min).
-    Cherche le plus bas ("low") le plus profond dans les bougies minute
-    GeckoTerminal (précision à la minute). Si aucune bougie exploitable
-    n'est disponible, retombe sur le suivi par polling du bot
-    (min_price/min_price_time, précision ~2 minutes, voire meilleure pour
-    les 20 premières secondes/3 premières minutes — cf. min_price_time mis
-    à jour dans analyser_20_premieres_secondes/analyser_metriques_etendues/
-    monitor_ath).
-    """
     time_to_dd = None
     prix_au_plus_bas = None
 
@@ -588,12 +558,8 @@ def calculer_timing_drawdown(ohlcv_list, prix_initial, start_time, min_price_fal
             prix_au_plus_bas = None
 
     if time_to_dd is None:
-        # Repli sur le suivi par polling du bot (moins précis, mais toujours disponible)
         time_to_dd = min_price_time_fallback
 
-    # max_drawdown_before_peak est calculé séparément (min_price/initial_mc,
-    # cf. monitor_ath) : on ne le recalcule pas ici pour rester cohérent
-    # avec la colonne existante, on se contente de dater le point bas.
     minutes_ecoulees = (time_to_dd or 0) / 60
     return time_to_dd, minutes_ecoulees
 
@@ -601,27 +567,13 @@ def calculer_timing_drawdown(ohlcv_list, prix_initial, start_time, min_price_fal
 # ============================================================
 # --- SIMULATIONS DE STRATÉGIES DE SORTIE (benchmark, a posteriori) ---
 # ============================================================
-# Ces simulations sont purement informatives : elles tournent APRÈS coup
-# (au moment du rapport 30 min), sur la trajectoire de prix réelle fournie
-# par les bougies minute GeckoTerminal, pour comparer plusieurs stratégies
-# de sortie hypothétiques sur une mise de référence commune. Elles n'ont
-# AUCUN effet sur la logique d'achat (signal_valide) ni sur la simulation
-# de position "position_statut" existante (gerer_simulation_position),
-# qui reste la seule simulation utilisée pour la décision/le suivi
-# opérationnel du bot.
 MISE_SIMULATION_USD = 100
-SIMU_TRAILING_TECH_B_PCT = -0.20   # Technique B : trailing -20% après x2
-SIMU_TRAILING_TECH_C_PCT = -0.30   # Technique C : trailing -30% après x2
-SIMU_TRAILING_TECH_E_PCT = -0.20   # Technique E : trailing -20% dès le premier profit
+SIMU_TRAILING_TECH_B_PCT = -0.20
+SIMU_TRAILING_TECH_C_PCT = -0.30
+SIMU_TRAILING_TECH_E_PCT = -0.20
 
 
 def _mult_path_depuis_ohlcv(ohlcv_list, prix_initial):
-    """
-    Construit la trajectoire du multiplicateur (open/high/low/close) à
-    partir des bougies minute GeckoTerminal, triées chronologiquement.
-    GeckoTerminal renvoie les bougies du plus récent au plus ancien : on
-    les trie donc par timestamp croissant avant de les utiliser.
-    """
     if not ohlcv_list or not prix_initial:
         return []
     bougies = sorted(ohlcv_list, key=lambda c: c[0])
@@ -637,16 +589,6 @@ def _mult_path_depuis_ohlcv(ohlcv_list, prix_initial):
 
 
 def _simuler_trailing_apres_seuil(path, seuil_activation, trailing_pct, seuil_sortie_anticipee=None):
-    """
-    Simule une position qui reste ouverte tant que le multiplicateur n'a
-    pas atteint `seuil_activation`. Une fois `seuil_activation` atteint, un
-    trailing stop de `trailing_pct` (ex: -0.20) est armé depuis le plus
-    haut observé. Si `seuil_sortie_anticipee` est fourni (ex: x3 pour une
-    tranche), une sortie immédiate à ce multiplicateur a priorité sur le
-    trailing dès qu'il est atteint (utile pour les paliers de prise de
-    profit fixes). Retourne le pourcentage de gain/perte simulé.
-    Sert de brique commune aux techniques A, B, C, D (tranches) et E.
-    """
     if not path:
         return 0.0
 
@@ -669,37 +611,22 @@ def _simuler_trailing_apres_seuil(path, seuil_activation, trailing_pct, seuil_so
 
 
 def simuler_strategies_sortie(ohlcv_list, prix_initial, mise_usd=MISE_SIMULATION_USD):
-    """
-    Simule, a posteriori, ce qu'auraient donné 6 stratégies de sortie sur
-    la trajectoire de prix réelle du trade, pour une mise de référence de
-    `mise_usd`. Purement informatif (benchmark CSV) — voir note en tête de
-    section. Retourne un dict avec les clés sim_*_pct / sim_*_usd (valeurs
-    None si aucune donnée de bougie n'est exploitable).
-    """
     cles = ("sim_remb", "sim_ts20", "sim_ts30", "sim_3paliers", "sim_ts_immediat", "sim_peak")
     path = _mult_path_depuis_ohlcv(ohlcv_list, prix_initial)
     if not path:
         return {f"{c}_pct": None for c in cles} | {f"{c}_usd": None for c in cles}
 
-    # --- Technique A : Remboursement x2 (sortie 100% à x2, sinon prix final) ---
     pct_a = _simuler_trailing_apres_seuil(path, seuil_activation=float("inf"), trailing_pct=0.0, seuil_sortie_anticipee=2.0)
-
-    # --- Technique B : Trailing stop -20% après x2 ---
     pct_b = _simuler_trailing_apres_seuil(path, seuil_activation=2.0, trailing_pct=SIMU_TRAILING_TECH_B_PCT)
-
-    # --- Technique C : Trailing stop -30% après x2 ---
     pct_c = _simuler_trailing_apres_seuil(path, seuil_activation=2.0, trailing_pct=SIMU_TRAILING_TECH_C_PCT)
 
-    # --- Technique D : 3 paliers (50% à x2 / 25% à x3 / 25% trailing -20%) ---
-    p1 = pct_a  # tranche 1 (50%) : identique à la technique A
+    p1 = pct_a
     p2 = _simuler_trailing_apres_seuil(path, seuil_activation=2.0, trailing_pct=SIMU_TRAILING_TECH_B_PCT, seuil_sortie_anticipee=3.0)
-    p3 = pct_b  # tranche 3 (25%) : identique à la technique B
+    p3 = pct_b
     pct_3paliers = 0.5 * p1 + 0.25 * p2 + 0.25 * p3
 
-    # --- Technique E : Trailing stop immédiat dès le premier profit ---
     pct_e = _simuler_trailing_apres_seuil(path, seuil_activation=1.0, trailing_pct=SIMU_TRAILING_TECH_E_PCT)
 
-    # --- Technique F : Sommet théorique max (benchmark, sortie au plus haut absolu) ---
     peak_max = max(h_m for _, h_m, _, _ in path)
     pct_f = (peak_max - 1) * 100
 
@@ -806,15 +733,6 @@ def fetch_pair_data(mint):
         return None
 
 
-# ============================================================
-# --- ⚠️ LOGIQUE DE DÉCISION D'ACHAT — NON MODIFIÉE ---
-# ============================================================
-# La fonction ci-dessous (analyser_20_premieres_secondes) calcule
-# signal_valide et pilote l'ouverture de la position simulée. Elle est
-# restée STRICTEMENT IDENTIQUE à la version précédente du bot pour toute
-# sa logique de décision : la SEULE addition est la mise à jour de
-# min_price/min_price_time (nouveau, pour dater la chute), qui ne modifie
-# ni ne lit aucune variable utilisée par signal_valide/position_statut.
 def analyser_20_premieres_secondes(mint):
     data = active_tokens.get(mint)
     if not data:
@@ -848,8 +766,6 @@ def analyser_20_premieres_secondes(mint):
         if mint in active_tokens:
             active_tokens[mint]["low_second_20s"] = low_second
             active_tokens[mint]["low_mult_20s"] = round(low_mult, 3)
-            # Met à jour le plus bas global (et son horodatage) si ce point
-            # des 20 premières secondes est plus bas que ce qui est connu.
             if low_mc < active_tokens[mint].get("min_price", low_mc):
                 active_tokens[mint]["min_price"] = low_mc
                 active_tokens[mint]["min_price_time"] = low_second
@@ -858,12 +774,24 @@ def analyser_20_premieres_secondes(mint):
         print(f"[analyse_20s] aucune donnée de market cap exploitable pour {mint}")
 
     deltas = []
-    for (e_prev, _, b_prev, s_prev), (e_next, _, b_next, s_next) in zip(samples, samples[1:]):
+    echecs_pair = 0
+    for (e_prev, mc_prev, b_prev, s_prev), (e_next, mc_next, b_next, s_next) in zip(samples, samples[1:]):
         if None in (b_prev, s_prev, b_next, s_next):
+            # b/s valent None quand fetch_pair_data n'a rien renvoyé (pair pas
+            # encore indexée par DexScreener) ou quand la pair existait mais
+            # sans champ txns.m5 exploitable à cet instant précis.
+            echecs_pair += 1
             continue
         delta_achats = max(b_next - b_prev, 0)
         delta_ventes = max(s_next - s_prev, 0)
         deltas.append((e_prev, e_next, delta_achats, delta_ventes))
+
+    if not deltas:
+        buy_ratio_diag = "pair_introuvable" if echecs_pair >= len(samples) - 1 else "aucune_activite_detectee"
+    elif all((da + dv) == 0 for _, _, da, dv in deltas):
+        buy_ratio_diag = "aucune_activite_detectee"
+    else:
+        buy_ratio_diag = "ok"
 
     achats_bruts_2s = None
     buy_ratio_2s = None
@@ -896,21 +824,12 @@ def analyser_20_premieres_secondes(mint):
         active_tokens[mint]["buy_ratio_2s"] = buy_ratio_2s
         active_tokens[mint]["tx_velocity_5s"] = tx_velocity_5s
         active_tokens[mint]["buy_ratio_5s"] = buy_ratio_5s
+        active_tokens[mint]["buy_ratio_diag"] = buy_ratio_diag
 
-        # --- Validation du signal + ouverture éventuelle de la simulation SL/TP ---
         entry_stats = active_tokens[mint].get("entry_stats", {})
         price_change_m5 = entry_stats.get("price_change_m5")
         tx_accel = entry_stats.get("tx_accel")
 
-        # Ratio buy/sell utilisé pour la validation du signal : buy_ratio_20s
-        # en priorité (mesuré après l'alerte, sur les 20 premières secondes
-        # de trading). S'il est absent (NaN — ex: DexScreener a renvoyé une
-        # valeur nulle sur au moins une des mesures, rendant les deltas
-        # incalculables), on bascule sur un ratio de repli calculé à partir
-        # des transactions m5 déjà connues à l'alerte (achats_m5/ventes_m5) :
-        # ce n'est pas la même fenêtre temporelle que buy_ratio_20s, mais ça
-        # évite de rejeter automatiquement un token valide à cause d'un bug
-        # de collecte de données plutôt qu'un vrai signal faible.
         ratio_utilise = buy_ratio_20s
         ratio_source = "buy_ratio_20s"
         if ratio_utilise is None and FALLBACK_BUY_RATIO_ENABLED:
@@ -920,7 +839,7 @@ def analyser_20_premieres_secondes(mint):
                 ratio_utilise = round(achats_m5 / (achats_m5 + ventes_m5), 3)
                 ratio_source = "fallback_m5"
         if ratio_utilise is None:
-            ratio_source = "aucune_donnee"  # ni buy_ratio_20s ni fallback m5 n'étaient exploitables
+            ratio_source = "aucune_donnee"
 
         seuil_ratio = FALLBACK_BUY_RATIO_MIN if ratio_source == "fallback_m5" else TRIGGER_BUY_RATIO_20S_MIN
 
@@ -929,7 +848,7 @@ def analyser_20_premieres_secondes(mint):
             and passe_filtres_triggers(initial_mc, price_change_m5, tx_accel)
         )
         active_tokens[mint]["signal_valide"] = signal_valide
-        active_tokens[mint]["buy_ratio_source"] = ratio_source  # persiste la donnée pour le CSV (étape 1/3)
+        active_tokens[mint]["buy_ratio_source"] = ratio_source
         if ratio_source == "fallback_m5":
             print(f"[simulation] {data['symbol']} ({mint}) — buy_ratio_20s absent, fallback_m5 utilisé = {ratio_utilise}")
 
@@ -937,7 +856,7 @@ def analyser_20_premieres_secondes(mint):
             active_tokens[mint]["prix_entree_simule"] = dernier_mc_valide
             active_tokens[mint]["sl_prix_simule"] = dernier_mc_valide * (1 + SIMULATION_SL_PCT)
             active_tokens[mint]["position_statut"] = "ouverte"
-            active_tokens[mint]["entry_time"] = time.time()  # horodatage exact de l'achat simulé, pour le Time-based Exit
+            active_tokens[mint]["entry_time"] = time.time()
             print(f"[simulation] {data['symbol']} ({mint}) — signal validé, position simulée ouverte à ${dernier_mc_valide:,.0f}")
         else:
             active_tokens[mint]["position_statut"] = "signal_non_valide"
@@ -949,18 +868,8 @@ def analyser_20_premieres_secondes(mint):
     )
 
 
-# ============================================================
-# --- NOUVELLES MÉTRIQUES ÉTENDUES (10s / 1min / 3min) ---
-# ============================================================
-# Échantillonnage INDÉPENDANT de analyser_20_premieres_secondes, démarré
-# dans son propre thread depuis essayer_alerter. Cette fonction ne lit et
-# n'écrit JAMAIS les champs utilisés par signal_valide / position_statut /
-# gerer_simulation_position : elle se contente d'ajouter des colonnes
-# supplémentaires (reporting) sur le token déjà alerté. La mise à jour de
-# min_price/min_price_time (pour dater la chute) est la seule addition
-# partagée avec le reste du bot, en lecture/écriture non bloquante.
-METRIQUES_ETENDUES_DUREE = 180          # 3 minutes suivies pour les métriques élargies
-METRIQUES_ETENDUES_INTERVAL = 5         # secondes entre 2 mesures
+METRIQUES_ETENDUES_DUREE = 180
+METRIQUES_ETENDUES_INTERVAL = 5
 
 
 def analyser_metriques_etendues(mint):
@@ -971,7 +880,7 @@ def analyser_metriques_etendues(mint):
     initial_price = data.get("initial_price")
     start = data["start_time"]
 
-    samples = []  # (elapsed, mc, price_usd, buys_m5, sells_m5, volume_m5)
+    samples = []
 
     prochain_t = 0
     while prochain_t <= METRIQUES_ETENDUES_DUREE:
@@ -990,17 +899,14 @@ def analyser_metriques_etendues(mint):
             volume_m5 = (pair.get("volume") or {}).get("m5")
         samples.append((elapsed, mc, price_usd, buys_m5, sells_m5, volume_m5))
 
-        # Met à jour le plus bas global (et son horodatage) en direct, dès
-        # qu'un point plus bas que le minimum connu est observé.
         if mc and mint in active_tokens and mc < active_tokens[mint].get("min_price", mc):
             active_tokens[mint]["min_price"] = mc
             active_tokens[mint]["min_price_time"] = elapsed
 
         prochain_t += METRIQUES_ETENDUES_INTERVAL
         if mint not in active_tokens:
-            return  # le token a été retiré (rapport déjà envoyé) -> on arrête l'échantillonnage
+            return
 
-    # --- Deltas achats/ventes/volume entre mesures successives ---
     deltas = []
     max_tx_par_seconde = 0
     for (e_prev, _, _, b_prev, s_prev, v_prev), (e_next, _, _, b_next, s_next, v_next) in zip(samples, samples[1:]):
@@ -1042,7 +948,6 @@ def analyser_metriques_etendues(mint):
     ratio_achats_m1_m5 = round(_safe_div(achats_m1, achats_m5_alerte), 4)
     buy_tx_ratio_m5 = round(_safe_div(achats_m5_alerte, (achats_m5_alerte or 0) + (ventes_m5_alerte or 0)), 4)
 
-    # --- Prix / multiplicateur à des instants précis (échantillon le plus proche disponible) ---
     def _valeur_au_plus_proche(t_cible, index_valeur):
         candidats = [s for s in samples if s[index_valeur] is not None]
         if not candidats:
@@ -1114,7 +1019,6 @@ def essayer_alerter(mint, pair, source_url):
         print(f"[filtré] {symbol} ({mint}) — MC=${market_cap:,.0f} Liq=${liquidity_usd:,.0f}")
         return False
 
-    # --- Calcul anticipé de price_change_m5 / tx_accel pour le filtre de trigger ---
     txns = pair.get("txns") or {}
     volume = pair.get("volume") or {}
     txns_m5 = txns.get("m5") or {}
@@ -1142,16 +1046,9 @@ def essayer_alerter(mint, pair, source_url):
         except (TypeError, ValueError):
             pool_age_seconds = None
 
-    # --- Détection boost DexScreener ---
     boost_detecte, nombre_boosts_actifs = extraire_infos_boost(pair)
-
-    # --- Détection profil DexScreener (site web / réseaux sociaux) ---
     a_un_profil, site_web, twitter, telegram_link = extraire_infos_profil(pair)
 
-    # --- Taille moyenne des ordres (approximation, cf. limitation ci-dessous) ---
-    # DexScreener ne distingue PAS le volume acheteur du volume vendeur : on ne
-    # peut donc calculer qu'une taille d'ordre MOYENNE globale, appliquée aux
-    # deux colonnes achat/vente faute de meilleure donnée disponible.
     sol_price = get_sol_usd_price()
     volume_m5 = volume.get("m5")
     avg_order_size_sol = None
@@ -1169,8 +1066,7 @@ def essayer_alerter(mint, pair, source_url):
         "volume_h1": volume.get("h1"),
         "price_change_m5": price_change_m5,
         "tx_accel": tx_accel,
-        "avg_buy_size_sol": avg_order_size_sol,
-        "avg_sell_size_sol": avg_order_size_sol,
+        "avg_order_size_sol": avg_order_size_sol,
     }
 
     flags_txt = ", ".join(rug_flags) if rug_flags else "Aucun"
@@ -1205,9 +1101,9 @@ def essayer_alerter(mint, pair, source_url):
         "dex": dex_name,
         "initial_mc": market_cap or 1.0,
         "max_price": market_cap or 1.0,
-        "max_price_time": 0,  # horodatage (secondes écoulées depuis l'alerte) du dernier max observé -> time_to_peak
+        "max_price_time": 0,
         "min_price": market_cap or 1.0,
-        "min_price_time": 0,  # horodatage (secondes écoulées depuis l'alerte) du plus bas observé -> time_to_max_drawdown
+        "min_price_time": 0,
         "liquidity_usd": liquidity_usd,
         "rugcheck_score": rug_score,
         "rugcheck_flags": flags_txt,
@@ -1222,23 +1118,18 @@ def essayer_alerter(mint, pair, source_url):
         "entry_stats": entry_stats,
         "pool_address": pair.get("pairAddress"),
         "initial_price": _to_float(pair.get("priceUsd")),
-        # champs boost DexScreener (mis à jour aussi dans monitor_ath si le
-        # boost apparaît après coup, pas seulement à l'alerte initiale)
         "boost_detecte": boost_detecte,
         "nombre_boosts_actifs": nombre_boosts_actifs,
-        # champs profil DexScreener (mis à jour aussi dans monitor_ath si le
-        # profil apparaît/se complète après coup)
         "profil_dexscreener": a_un_profil,
         "site_web": site_web,
         "twitter": twitter,
         "telegram": telegram_link,
-        # champs simulation SL/TP (remplis après les 20 premières secondes)
         "signal_valide": None,
-        "buy_ratio_source": None,  # "buy_ratio_20s" | "fallback_m5" | "aucune_donnee"
+        "buy_ratio_source": None,
         "position_statut": "analyse_20s_en_cours",
         "prix_entree_simule": None,
         "sl_prix_simule": None,
-        "entry_time": None,  # horodatage exact de l'achat simulé, utilisé par le Time-based Exit
+        "entry_time": None,
         "tp1_atteint": False,
         "tp2_atteint": False,
         "max_price_apres_tp2": None,
@@ -1247,8 +1138,7 @@ def essayer_alerter(mint, pair, source_url):
         "time_to_3x": None,
         "tx_velocity_5s": None,
         "buy_ratio_5s": None,
-        # champs métriques étendues (remplis en arrière-plan par
-        # analyser_metriques_etendues, sur les 3 premières minutes)
+        "buy_ratio_diag": None,
         "achats_10s": None,
         "ventes_10s": None,
         "achats_m1": None,
@@ -1373,10 +1263,6 @@ def monitor_ath():
                             active_tokens[mint]["min_price"] = current_mc
                             active_tokens[mint]["min_price_time"] = round(elapsed)
 
-                        # Le boost peut apparaître après l'alerte initiale :
-                        # on met à jour le statut à chaque vérification prix
-                        # si un boost devient actif (on ne le "désactive"
-                        # jamais automatiquement, un boost déjà vu compte).
                         boost_detecte_maj, nb_boosts_maj = extraire_infos_boost(pairs[0])
                         if boost_detecte_maj:
                             active_tokens[mint]["boost_detecte"] = True
@@ -1384,8 +1270,6 @@ def monitor_ath():
                                 nb_boosts_maj, active_tokens[mint].get("nombre_boosts_actifs", 0) or 0
                             )
 
-                        # Le profil DexScreener peut aussi être ajouté/complété
-                        # après l'alerte initiale : on met à jour si détecté.
                         profil_detecte_maj, site_maj, twitter_maj, telegram_maj = extraire_infos_profil(pairs[0])
                         if profil_detecte_maj:
                             active_tokens[mint]["profil_dexscreener"] = True
@@ -1393,7 +1277,6 @@ def monitor_ath():
                             active_tokens[mint]["twitter"] = active_tokens[mint].get("twitter") or twitter_maj
                             active_tokens[mint]["telegram"] = active_tokens[mint].get("telegram") or telegram_maj
 
-                        # --- Simulation SL/TP (aucun ordre réel, tracking seulement) ---
                         if current_mc:
                             gerer_simulation_position(mint, current_mc, elapsed)
                     else:
@@ -1407,10 +1290,6 @@ def monitor_ath():
             initial_mc = data["initial_mc"] or 1.0
             pool_address = data.get("pool_address")
 
-            # Un seul appel GeckoTerminal (bougies minute), réutilisé à la
-            # fois pour l'ATH réel, les simulations de stratégies de sortie
-            # (simuler_strategies_sortie), et le timing de la chute
-            # (calculer_timing_drawdown), plutôt que plusieurs appels séparés.
             elapsed_minutes = max(int(elapsed / 60) + 5, 10)
             ohlcv_list = fetch_ohlcv_minute(pool_address, elapsed_minutes)
 
@@ -1420,10 +1299,6 @@ def monitor_ath():
             print(f"[monitor_ath] {data['symbol']} ({mint}) GeckoTerminal ATH mc={true_ath_mc}")
             max_mc = max(active_tokens[mint]["max_price"], true_ath_mc or 0)
 
-            # Si l'ATH réel (GeckoTerminal) dépasse le max observé par
-            # polling, on recale time_to_peak sur l'horodatage de la
-            # bougie correspondante (plus précis que le polling toutes les
-            # 2 minutes).
             temps_pic = active_tokens[mint].get("max_price_time", 0)
             if ohlcv_list and true_ath_mc and true_ath_mc >= active_tokens[mint]["max_price"]:
                 try:
@@ -1441,7 +1316,6 @@ def monitor_ath():
                 if data.get("boost_detecte") else "Non"
             )
 
-            # --- Finalisation de la simulation SL/TP si jamais clôturée ---
             if data.get("signal_valide") and data.get("resultat_pct_simule") is None:
                 entree = data.get("prix_entree_simule") or initial_mc
                 active_tokens[mint]["resultat_pct_simule"] = round((max_mc / entree - 1) * 100, 2)
@@ -1477,17 +1351,14 @@ def monitor_ath():
             min_price = data.get("min_price", initial_mc)
             max_drawdown_before_peak = round((min_price / initial_mc - 1) * 100, 2) if initial_mc else None
 
-            # --- Nouvelles métriques calculées au moment de la finalisation ---
             liquidite_usd = data.get("liquidity_usd")
             pool_age_seconds = data.get("pool_age_seconds")
             pool_age_minutes = round(pool_age_seconds / 60, 2) if pool_age_seconds is not None else None
             is_golden_window = (pool_age_seconds is not None and pool_age_seconds <= GOLDEN_WINDOW_MAX_SECONDS)
             ratio_liquidite_mc = round(_safe_div(liquidite_usd, initial_mc), 4)
 
-            # --- Simulations de stratégies de sortie (benchmark, mise 100$) ---
             simulations_sortie = simuler_strategies_sortie(ohlcv_list, data.get("initial_price"))
 
-            # --- Vitesse / timing de la chute (nouvelles colonnes) ---
             time_to_max_drawdown, minutes_ecoulees_dd = calculer_timing_drawdown(
                 ohlcv_list, data.get("initial_price"), data["start_time"],
                 min_price, data.get("min_price_time", 0),
@@ -1497,10 +1368,6 @@ def monitor_ath():
                 vitesse_chute_pct_par_min = round(max_drawdown_before_peak / minutes_ecoulees_dd, 2)
             elif max_drawdown_before_peak == 0:
                 vitesse_chute_pct_par_min = 0.0
-            # Si minutes_ecoulees_dd == 0 alors que max_drawdown_before_peak < 0,
-            # la chute a eu lieu quasi instantanément (à la 1ère seconde
-            # observée) : la vitesse n'est pas calculable proprement (division
-            # par ~0), on laisse None plutôt que d'afficher un nombre absurde.
 
             log_resultat_csv({
                 "horodatage": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1534,21 +1401,17 @@ def monitor_ath():
                 "price_change_m5": entry_stats.get("price_change_m5"),
                 "tx_accel": entry_stats.get("tx_accel"),
                 "buy_ratio_2s": data.get("buy_ratio_2s"),
-                # --- stats boost DexScreener ---
                 "boost_detecte": data.get("boost_detecte", False),
                 "nombre_boosts_actifs": data.get("nombre_boosts_actifs", 0),
-                # --- stats profil DexScreener ---
                 "profil_dexscreener": data.get("profil_dexscreener", False),
                 "site_web": data.get("site_web"),
                 "twitter": data.get("twitter"),
                 "telegram": data.get("telegram"),
-                # --- vélocité / qualité des ordres ---
                 "tx_velocity_5s": data.get("tx_velocity_5s"),
                 "buy_ratio_5s": data.get("buy_ratio_5s"),
-                "avg_buy_size_sol": entry_stats.get("avg_buy_size_sol"),
-                "avg_sell_size_sol": entry_stats.get("avg_sell_size_sol"),
-                "unique_buyers_count": None,  # non disponible via DexScreener
-                # --- simulation SL/TP ---
+                "avg_order_size_sol": entry_stats.get("avg_order_size_sol"),
+                "unique_buyers_count": None,
+                "buy_ratio_diag": data.get("buy_ratio_diag"),
                 "signal_valide": data.get("signal_valide"),
                 "buy_ratio_source": data.get("buy_ratio_source"),
                 "position_statut": data.get("position_statut"),
@@ -1556,7 +1419,6 @@ def monitor_ath():
                 "time_to_2x": data.get("time_to_2x"),
                 "time_to_3x": data.get("time_to_3x"),
                 "max_drawdown_before_peak": max_drawdown_before_peak,
-                # --- A. fenêtres temporelles courtes ---
                 "achats_10s": data.get("achats_10s"),
                 "ventes_10s": data.get("ventes_10s"),
                 "volume_m1": data.get("volume_m1"),
@@ -1567,22 +1429,17 @@ def monitor_ath():
                 "achats_m1": data.get("achats_m1"),
                 "ratio_achats_m1_m5": data.get("ratio_achats_m1_m5"),
                 "buy_tx_ratio_m5": data.get("buy_tx_ratio_m5"),
-                # --- B. trajectoire du multiplicateur ---
                 "mult_10s": data.get("mult_10s"),
                 "mult_30s": data.get("mult_30s"),
                 "mult_1m": data.get("mult_1m"),
-                # --- C. acheteurs / liquidité / squeeze ---
                 "ratio_liquidite_mc": ratio_liquidite_mc,
                 "sell_ratio_1m": data.get("sell_ratio_1m"),
                 "max_tx_per_second": data.get("max_tx_per_second"),
-                # --- D. suivi temporel ---
                 "pool_age_minutes": pool_age_minutes,
                 "is_golden_window": is_golden_window,
                 "time_to_peak": temps_pic,
-                # --- E. vitesse / timing de la chute ---
                 "time_to_max_drawdown": time_to_max_drawdown,
                 "vitesse_chute_pct_par_min": vitesse_chute_pct_par_min,
-                # --- simulations stratégies de sortie ---
                 **simulations_sortie,
             })
 
@@ -1591,25 +1448,6 @@ def monitor_ath():
     for mint in tokens_to_remove:
         active_tokens.pop(mint, None)
 
-
-# ============================================================
-# --- MODULE CANAL DEXTOOLSPUBLIC : suivi indépendant ---
-# ============================================================
-#
-# Ce module n'a AUCUN rapport avec la logique de détection/filtres du
-# bot ci-dessus (DexScreener token-profiles, filtres qualité/trigger,
-# RugCheck, simulation SL/TP...). Il lit TOUS les posts du
-# canal Telegram public t.me/DexToolsPublic, SANS AUCUN FILTRE, capture
-# les infos affichées dans le message d'alerte (Pair Age, 24h %, volume,
-# buys/sells, boosts...), puis suit chaque token pendant 24h pour
-# calculer le multiplicateur entre le market cap au moment de l'alerte
-# et l'ATH atteint sur ces 24h. Le résultat est loggé dans un CSV séparé
-# (DEXTOOLS_LOG_FILE), distinct de LOG_FILE ci-dessus.
-#
-# Il réutilise volontairement les fonctions déjà définies plus haut
-# (fetch_pair_data, rugcheck_verdict, extraire_infos_boost,
-# extraire_infos_profil, send_telegram_message, send_telegram_document,
-# _to_float) au lieu de les redéfinir.
 
 DEXTOOLS_CHANNEL = "DexToolsPublic"
 DEXTOOLS_CHANNEL_URL = f"https://t.me/s/{DEXTOOLS_CHANNEL}"
@@ -1627,20 +1465,18 @@ DEXTOOLS_LOG_FIELDS = [
     "lien_dexscreener", "lien_post_telegram",
 ]
 
-DEXTOOLS_CHANNEL_CHECK_INTERVAL = 60     # secondes entre 2 lectures du canal
-DEXTOOLS_PRICE_CHECK_INTERVAL = 300      # secondes entre 2 vérifications de prix pendant le suivi 24h
-DEXTOOLS_TRACK_DURATION = 24 * 3600      # durée totale de suivi avant de clôturer et écrire la ligne CSV
+DEXTOOLS_CHANNEL_CHECK_INTERVAL = 60
+DEXTOOLS_PRICE_CHECK_INTERVAL = 300
+DEXTOOLS_TRACK_DURATION = 24 * 3600
 
-dextools_tracked = {}        # mint -> données de suivi en cours
-dextools_seen_posts = set()  # ids de posts déjà traités (anti-doublon)
+dextools_tracked = {}
+dextools_seen_posts = set()
 
 _dextools_last_channel_check = 0
 _dextools_last_price_check = 0
 
-# Adresse Solana (base58, ni 0/O/I/l) — best-effort pour repérer la CA dans le texte brut
 SOLANA_ADDRESS_RE = re.compile(r'\b[1-9A-HJ-NP-Za-km-z]{32,44}\b')
 
-# Liens vers un explorer/aggrégateur contenant directement le mint (plus fiable que le texte brut)
 CA_FROM_LINK_RE = re.compile(
     r'(?:dexscreener\.com/solana/|solscan\.io/token/|birdeye\.so/token/|pump\.fun/(?:coin/)?)'
     r'([1-9A-HJ-NP-Za-km-z]{32,44})'
@@ -1664,7 +1500,6 @@ BOOSTS_RE = re.compile(r'Boosts?:\s*([0-9]+)', re.IGNORECASE)
 
 
 def _dextools_nettoyer_html(fragment_html):
-    """Retire les balises HTML d'un fragment de message tout en gardant le texte lisible (br -> saut de ligne)."""
     if not fragment_html:
         return ""
     texte = re.sub(r'<br\s*/?>', '\n', fragment_html)
@@ -1689,7 +1524,6 @@ def fetch_dextools_channel_html():
 
 
 def extraire_mint_dextools(message_html, message_txt):
-    """Cherche d'abord une CA dans un lien connu (plus fiable), sinon retombe sur un pattern base58 brut."""
     m = CA_FROM_LINK_RE.search(message_html)
     if m:
         return m.group(1)
@@ -1698,12 +1532,6 @@ def extraire_mint_dextools(message_html, message_txt):
 
 
 def extraire_infos_alerte_dextools(message_html):
-    """
-    Extrait les infos affichées dans le message d'alerte du canal, au format
-    donné en exemple : Pair Age / 24h % / Volume / Buys / Sells / Boosts.
-    Tout est best-effort et stocké tel quel (texte brut) : le canal peut
-    changer son format, chaque champ manque proprement (None) sans planter.
-    """
     texte = _dextools_nettoyer_html(message_html)
 
     symbole = None
@@ -1744,7 +1572,6 @@ def extraire_infos_alerte_dextools(message_html):
 
 
 def check_dextools_channel():
-    """Lit le canal, repère les nouveaux posts, démarre le suivi 24h pour chaque nouveau token trouvé (sans exception, aucun filtre)."""
     page_html = fetch_dextools_channel_html()
     if not page_html:
         return
@@ -1755,7 +1582,7 @@ def check_dextools_channel():
             continue
         dextools_seen_posts.add(post_id)
 
-        bloc = page_html[match.start():match.start() + 6000]  # fenêtre large autour du post pour capter le texte du message
+        bloc = page_html[match.start():match.start() + 6000]
         text_match = MESSAGE_TEXT_RE.search(bloc)
         message_html = text_match.group("text") if text_match else ""
         message_txt = _dextools_nettoyer_html(message_html)
@@ -1782,7 +1609,6 @@ def check_dextools_channel():
 
 
 def check_dextools_channel_throttled():
-    """Ne lit le canal qu'au rythme de DEXTOOLS_CHANNEL_CHECK_INTERVAL, même si appelée plus souvent depuis la boucle principale."""
     global _dextools_last_channel_check
     now = time.time()
     if (now - _dextools_last_channel_check) < DEXTOOLS_CHANNEL_CHECK_INTERVAL:
@@ -1792,8 +1618,6 @@ def check_dextools_channel_throttled():
 
 
 def demarrer_suivi_dextools(mint, infos_alerte, post_id, alert_time, alert_dt):
-    """Enrichit le token avec les données dispo au moment de l'alerte (réutilise les fonctions du bot existant) et démarre le suivi 24h."""
-
     pair = fetch_pair_data(mint)
     mc_initial, prix_initial, liquidite_usd, pool_address = None, None, None, None
     if pair:
@@ -1802,9 +1626,6 @@ def demarrer_suivi_dextools(mint, infos_alerte, post_id, alert_time, alert_dt):
         liquidite_usd = (pair.get("liquidity") or {}).get("usd")
         pool_address = pair.get("pairAddress")
 
-    # rugcheck_verdict() sert ici UNIQUEMENT à remplir des colonnes
-    # d'information : on ignore volontairement le booléen "ok", aucun
-    # token n'est filtré/rejeté dans ce module.
     _rug_ok, score_rugcheck, flags_rugcheck, top10_pct, insiders_detected, lp_locked_pct, total_holders, bundle_detected = rugcheck_verdict(mint)
 
     a_un_profil, site_web, twitter, telegram_link = (False, None, None, None)
@@ -1848,12 +1669,6 @@ def demarrer_suivi_dextools(mint, infos_alerte, post_id, alert_time, alert_dt):
 
 
 def get_ath_24h_via_gecko(pool_address):
-    """
-    Récupère jusqu'à 24 bougies horaires GeckoTerminal et retourne
-    (plus_haut_prix_usd, timestamp_unix_de_la_bougie) ou (None, None).
-    Best-effort : si le pool n'existe pas encore sur GeckoTerminal ou que
-    l'API échoue, on retombe sur le suivi par polling (max_mc/max_mc_time).
-    """
     if not pool_address:
         return None, None
     try:
@@ -1865,7 +1680,6 @@ def get_ath_24h_via_gecko(pool_address):
         ohlcv_list = res.json().get("data", {}).get("attributes", {}).get("ohlcv_list", [])
         if not ohlcv_list:
             return None, None
-        # chaque bougie : [timestamp, open, high, low, close, volume]
         meilleure = max((c for c in ohlcv_list if len(c) >= 3), key=lambda c: c[2], default=None)
         if not meilleure:
             return None, None
@@ -1899,8 +1713,6 @@ def cloturer_suivi_dextools(mint):
     if gecko_high and data.get("prix_initial"):
         mc_ath_gecko = mc_initial * (gecko_high / data["prix_initial"])
 
-    # On garde la valeur la plus haute entre le suivi par polling et
-    # l'estimation GeckoTerminal, avec l'horodatage correspondant.
     candidats = [(data.get("max_mc") or mc_initial, data.get("max_mc_time"))]
     if mc_ath_gecko:
         candidats.append((mc_ath_gecko, gecko_ts))
@@ -1950,7 +1762,6 @@ def cloturer_suivi_dextools(mint):
 
 
 def monitor_dextools_ath():
-    """Met à jour le max market cap observé pour chaque token suivi, et clôture ceux dont les 24h sont écoulées."""
     global _dextools_last_price_check
     now = time.time()
 
@@ -1980,11 +1791,6 @@ def monitor_dextools_ath():
         cloturer_suivi_dextools(mint)
 
 
-# ============================================================
-# --- FIN MODULE CANAL DEXTOOLSPUBLIC ---
-# ============================================================
-
-
 if __name__ == "__main__":
     print("Bot de surveillance démarré...")
     while True:
@@ -1992,7 +1798,6 @@ if __name__ == "__main__":
         check_new_solana_tokens()
         check_pending_tokens()
         monitor_ath()
-        # --- module indépendant : canal Telegram DexToolsPublic (voir plus haut) ---
         check_dextools_channel_throttled()
         monitor_dextools_ath()
         time.sleep(10)
