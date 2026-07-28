@@ -733,6 +733,116 @@ def fetch_pair_data(mint):
         return None
 
 
+# ============================================================
+# --- FALLBACK : TRANSACTIONS RÉELLES VIA GECKOTERMINAL /trades ---
+# ============================================================
+# Le calcul principal de buy_ratio_10s/20s repose sur un DELTA du compteur
+# agrégé DexScreener (txns.m5.buys/sells), rafraîchi toutes les
+# ANALYSE_20S_SAMPLE_INTERVAL secondes. Deux cas le rendent inexploitable :
+#   - la pair n'est pas encore indexée par DexScreener juste après la
+#     migration (buy_ratio_diag = "pair_introuvable") ;
+#   - le compteur agrégé ne bouge pas entre deux polls, alors que des
+#     trades ont bien eu lieu (buy_ratio_diag = "aucune_activite_detectee").
+# Dans ces deux cas UNIQUEMENT, on interroge l'endpoint /trades de
+# GeckoTerminal, qui renvoie les transactions individuelles réelles
+# (type buy/sell + timestamp exact), pour recalculer les ratios sur les
+# mêmes fenêtres (2s/5s/10s/20s). Quand le diagnostic est "ok", ce fallback
+# n'est jamais appelé : le calcul DexScreener reste la méthode principale.
+def fetch_geckoterminal_trades(pool_address):
+    """
+    Récupère les transactions individuelles réelles (les plus récentes,
+    jusqu'à ~300 selon l'API) via l'endpoint /trades de GeckoTerminal pour
+    un pool donné. Retourne une liste de tuples (timestamp_unix, kind) où
+    kind vaut "buy" ou "sell", triée du plus ancien au plus récent, ou
+    None en cas d'échec / réponse vide.
+    """
+    if not pool_address:
+        return None
+    try:
+        url = f"https://api.geckoterminal.com/api/v2/networks/solana/pools/{pool_address}/trades"
+        res = requests.get(url, timeout=8)
+        if res.status_code != 200:
+            print(f"[geckoterminal_trades] status={res.status_code} pour {pool_address}")
+            return None
+        items = res.json().get("data") or []
+        trades = []
+        for item in items:
+            attrs = item.get("attributes") or {}
+            kind = attrs.get("kind")
+            ts_str = attrs.get("block_timestamp")
+            if kind not in ("buy", "sell") or not ts_str:
+                continue
+            try:
+                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
+            except (TypeError, ValueError):
+                continue
+            trades.append((ts, kind))
+        trades.sort(key=lambda t: t[0])
+        return trades or None
+    except Exception as e:
+        print(f"[geckoterminal_trades] erreur pour {pool_address} : {e}")
+        return None
+
+
+def _buy_ratio_depuis_trades(trades, start_time, fenetre_max_s):
+    """
+    Calcule (buy_ratio, achats, ventes) sur la fenêtre
+    [start_time, start_time + fenetre_max_s], à partir d'une liste de
+    trades réels (timestamp, kind) obtenue via fetch_geckoterminal_trades.
+    Retourne (None, 0, 0) si aucun trade dans la fenêtre.
+    """
+    if not trades:
+        return None, 0, 0
+    achats = ventes = 0
+    borne_sup = start_time + fenetre_max_s
+    for ts, kind in trades:
+        if ts < start_time or ts > borne_sup:
+            continue
+        if kind == "buy":
+            achats += 1
+        else:
+            ventes += 1
+    total = achats + ventes
+    if total == 0:
+        return None, 0, 0
+    return round(achats / total, 3), achats, ventes
+
+
+def calculer_buy_ratios_fallback_gecko(mint, pool_address, start_time):
+    """
+    Tente de recalculer buy_ratio_2s/5s/10s/20s (+ achats_bruts_2s et
+    tx_velocity_5s) à partir des trades réels GeckoTerminal. Retourne un
+    dict avec ces valeurs et un flag "reussi" (bool). N'écrit rien dans
+    active_tokens : c'est à l'appelant de décider quoi faire du résultat.
+    """
+    resultat_vide = {
+        "reussi": False,
+        "buy_ratio_2s": None, "achats_bruts_2s": None,
+        "buy_ratio_5s": None, "tx_velocity_5s": None,
+        "buy_ratio_10s": None, "buy_ratio_20s": None,
+    }
+    trades = fetch_geckoterminal_trades(pool_address)
+    if not trades:
+        print(f"[fallback_gecko] {mint} — aucune transaction récupérée via GeckoTerminal /trades")
+        return resultat_vide
+
+    br2, a2, v2 = _buy_ratio_depuis_trades(trades, start_time, 2)
+    br5, a5, v5 = _buy_ratio_depuis_trades(trades, start_time, 5)
+    br10, a10, v10 = _buy_ratio_depuis_trades(trades, start_time, 10)
+    br20, a20, v20 = _buy_ratio_depuis_trades(trades, start_time, ANALYSE_20S_DURATION)
+
+    if br20 is None and br10 is None:
+        print(f"[fallback_gecko] {mint} — aucun trade GeckoTerminal dans la fenêtre des 20 premières secondes")
+        return resultat_vide
+
+    return {
+        "reussi": True,
+        "buy_ratio_2s": br2, "achats_bruts_2s": (a2 - v2) if (a2 or v2) else None,
+        "buy_ratio_5s": br5, "tx_velocity_5s": a5 + v5,
+        "buy_ratio_10s": br10, "buy_ratio_20s": br20,
+    }
+
+
 def analyser_20_premieres_secondes(mint):
     data = active_tokens.get(mint)
     if not data:
@@ -817,6 +927,27 @@ def analyser_20_premieres_secondes(mint):
     buy_ratio_10s = _buy_ratio(10)
     buy_ratio_20s = _buy_ratio(ANALYSE_20S_DURATION)
 
+    # --- Fallback GeckoTerminal /trades : uniquement si le calcul
+    # DexScreener ci-dessus a échoué (diag != "ok"). Le calcul DexScreener
+    # reste la méthode principale et n'est jamais écrasé quand il a
+    # fonctionné. ---
+    if buy_ratio_diag != "ok":
+        pool_address = data.get("pool_address")
+        fallback = calculer_buy_ratios_fallback_gecko(mint, pool_address, start)
+        if fallback["reussi"]:
+            diag_original = buy_ratio_diag
+            buy_ratio_2s = fallback["buy_ratio_2s"]
+            achats_bruts_2s = fallback["achats_bruts_2s"]
+            buy_ratio_5s = fallback["buy_ratio_5s"]
+            tx_velocity_5s = fallback["tx_velocity_5s"]
+            buy_ratio_10s = fallback["buy_ratio_10s"]
+            buy_ratio_20s = fallback["buy_ratio_20s"]
+            buy_ratio_diag = "ok_geckoterminal"
+            print(
+                f"[fallback_gecko] {data['symbol']} ({mint}) — bascule réussie sur GeckoTerminal /trades "
+                f"(diag DexScreener original : {diag_original}) — buy_ratio_20s={buy_ratio_20s}"
+            )
+
     if mint in active_tokens:
         active_tokens[mint]["buy_ratio_10s"] = buy_ratio_10s
         active_tokens[mint]["buy_ratio_20s"] = buy_ratio_20s
@@ -864,7 +995,7 @@ def analyser_20_premieres_secondes(mint):
     print(
         f"[analyse_20s] {data['symbol']} ({mint}) — "
         f"buy_ratio_2s={buy_ratio_2s} buy_ratio_5s={buy_ratio_5s} buy_ratio_10s={buy_ratio_10s} "
-        f"buy_ratio_20s={buy_ratio_20s} achats_bruts_2s={achats_bruts_2s}"
+        f"buy_ratio_20s={buy_ratio_20s} achats_bruts_2s={achats_bruts_2s} buy_ratio_diag={buy_ratio_diag}"
     )
 
 
