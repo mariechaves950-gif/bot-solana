@@ -100,11 +100,14 @@ TRAILING_ACTIVATION_GAIN_PCT = 0.20
 FALLBACK_BUY_RATIO_ENABLED = True
 FALLBACK_BUY_RATIO_MIN = 0.55
 
-POOL_AGE_IDEAL_MAX_SECONDS = 600
+POOL_AGE_IDEAL_MAX_SECONDS = 180
 # Auparavant à False : le filtre n'était jamais appliqué, ce qui laissait
 # passer des tokens migrés depuis des heures (ex: un cas observé à 29h).
 # Passé à True pour rejeter tout token dont le pool a plus de
 # POOL_AGE_IDEAL_MAX_SECONDS au moment de la migration détectée.
+# Seuil abaissé à 180s (3 min) : l'analyse doit démarrer dès la migration,
+# pas des minutes après, sinon les signaux à 30s/3min entrent sur un token
+# déjà "vieux".
 POOL_AGE_STRICT_FILTER = True
 
 CREDIBILITY_BONUS_ENABLED = True
@@ -2223,7 +2226,7 @@ def check_boosted_tokens():
             print(f"Erreur lors de la vérification des tokens boostés ({url}) : {e}")
 
 
-PENDING_CHECK_INTERVAL = 30
+PENDING_CHECK_INTERVAL = 10
 _last_pending_check = 0
 
 
