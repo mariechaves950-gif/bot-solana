@@ -7,6 +7,14 @@ import threading
 import requests
 from datetime import datetime
 
+# pandas n'est nécessaire QUE pour le rapport comparatif des stratégies
+# (/comparatif). On ne veut pas que tout le bot plante au démarrage si
+# pandas n'est pas encore dans requirements.txt : on dégrade proprement.
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
+
 # --- CONFIGURATION ---
 # Le token ne doit JAMAIS être écrit en dur ici.
 # Sur Railway : Settings > Variables > ajoute TELEGRAM_TOKEN et CHAT_ID
@@ -16,9 +24,9 @@ CHAT_ID = os.environ.get("CHAT_ID")
 if not TELEGRAM_TOKEN or not CHAT_ID:
     raise RuntimeError("TELEGRAM_TOKEN ou CHAT_ID manquant dans les variables d'environnement")
 
-active_tokens = {}      # tokens alertés, en cours de suivi ATH
-seen_mints = set()      # mints déjà ALERTÉS (pour ne jamais ré-alerter le même token)
-pending_mints = {}      # mints vus mais PAS ENCORE migrés : mint -> premier vu (timestamp)
+active_tokens = {}  # tokens alertés, en cours de suivi ATH
+seen_mints = set()  # mints déjà ALERTÉS (pour ne jamais ré-alerter le même token)
+pending_mints = {}  # mints vus mais PAS ENCORE migrés : mint -> premier vu (timestamp)
 
 # Anti-doublon CSV : mints dont une ligne a déjà été écrite dans LOG_FILE au
 # cours de ce processus. Empêche qu'un même token soit journalisé deux fois
@@ -34,8 +42,8 @@ PENDING_MAX_AGE = 24 * 3600  # 24h
 # Ces seuils réduisent le bruit (tokens sans intérêt / scams grossiers)
 # mais ne garantissent JAMAIS qu'un token est fiable. Aucun filtre
 # automatique ne protège d'un rug pull.
-MIN_LIQUIDITY_USD = 5000      # liquidité minimum sur le pool
-MIN_LIQUIDITY_RATIO = 0.03    # liquidité doit représenter au moins 3% du market cap (si market cap connu)
+MIN_LIQUIDITY_USD = 5000  # liquidité minimum sur le pool
+MIN_LIQUIDITY_RATIO = 0.03  # liquidité doit représenter au moins 3% du market cap (si market cap connu)
 # MIN_MARKET_CAP a été retiré : le bot ne filtre plus par Market Cap, tous
 # les tokens sont traités sans exception, quel que soit leur Market Cap.
 
@@ -44,13 +52,20 @@ MIN_LIQUIDITY_RATIO = 0.03    # liquidité doit représenter au moins 3% du mark
 # PumpSwap ou Raydium. On ne veut alerter QUE sur les tokens déjà migrés.
 DEX_MIGRES = {"pumpswap", "raydium"}
 
+# --- CHAÎNE UNIQUE : SOLANA UNIQUEMENT ---
+# Toute source de tokens (profils DexScreener, boosts, canal Telegram
+# DexToolsPublic) est filtrée sur cette valeur avant d'être acceptée
+# n'importe où dans le pipeline. Aucun token Ethereum / BSC / Base / etc.
+# ne doit jamais atteindre essayer_alerter() ou demarrer_suivi_dextools().
+CHAIN_ID_SOLANA = "solana"
+
 # --- CONCENTRATION DES HOLDERS (topHolders / risks, via RugCheck) ---
 REJECT_TOP10_PCT = None
 REJECT_IF_INSIDERS = False
 
 # --- ANALYSE DES 20 PREMIÈRES SECONDES ---
-ANALYSE_20S_SAMPLE_INTERVAL = 2   # secondes entre 2 mesures
-ANALYSE_20S_DURATION = 20         # durée totale observée
+ANALYSE_20S_SAMPLE_INTERVAL = 2  # secondes entre 2 mesures
+ANALYSE_20S_DURATION = 20  # durée totale observée
 
 # ============================================================
 # --- FILTRES DE TRIGGER (signal d'entrée optimisé) ---
@@ -86,7 +101,11 @@ FALLBACK_BUY_RATIO_ENABLED = True
 FALLBACK_BUY_RATIO_MIN = 0.55
 
 POOL_AGE_IDEAL_MAX_SECONDS = 600
-POOL_AGE_STRICT_FILTER = False
+# Auparavant à False : le filtre n'était jamais appliqué, ce qui laissait
+# passer des tokens migrés depuis des heures (ex: un cas observé à 29h).
+# Passé à True pour rejeter tout token dont le pool a plus de
+# POOL_AGE_IDEAL_MAX_SECONDS au moment de la migration détectée.
+POOL_AGE_STRICT_FILTER = True
 
 CREDIBILITY_BONUS_ENABLED = True
 CREDIBILITY_BONUS_REQUIRES_BOTH = True
@@ -217,6 +236,13 @@ LOG_FIELDS = [
     "sim_3paliers_pct", "sim_3paliers_usd",
     "sim_ts_immediat_pct", "sim_ts_immediat_usd",
     "sim_peak_pct", "sim_peak_usd",
+    "strat_a_pct", "strat_a_usd",
+    "strat_b_pct", "strat_b_usd",
+    "strat_c_pct", "strat_c_usd",
+    "strat_d_pct", "strat_d_usd",
+    "strat_e_pct", "strat_e_usd",
+    "strat_f_pct", "strat_f_usd",
+    "strat_g_pct", "strat_g_usd",
 ]
 
 
@@ -506,6 +532,450 @@ def simuler_strategies_sortie(ohlcv_list, prix_initial, mise_usd=MISE_SIMULATION
     return sortie
 
 
+# ============================================================
+# --- STRATÉGIES DE SORTIE AVANCÉES (A à G) ---
+# ============================================================
+STRAT_A_SL_PCT = -0.25
+STRAT_A_SEUIL_ARMEMENT = 0.50
+STRAT_A_TRAILING_PCT = -0.15
+
+STRAT_B_SL_PCT = -0.25
+STRAT_B_SEUIL_VENTE = 0.50
+STRAT_B_TRAILING_PCT = -0.20
+
+STRAT_C_SL_PCT = -0.25
+STRAT_C_CAP_PCT = 0.40
+
+STRAT_D_SL_PCT = -0.25
+STRAT_D_PALIERS = (
+    (0.20, 0.0),
+    (0.40, 0.15),
+    (0.70, 0.40),
+)
+
+STRAT_E_SL_PLANCHER_PCT = -0.30
+STRAT_E_K_ATR = 2.0
+STRAT_E_FENETRE_BOUGIES = 5
+
+STRAT_F_SL_PCT = -0.25
+STRAT_F_MAX_MINUTES = 60
+
+STRAT_G_SL_PCT = -0.25
+STRAT_G_PALIERS = (
+    (0.30, 1 / 3),
+    (0.60, 1 / 3),
+)
+STRAT_G_TRAILING_FINAL_PCT = -0.10
+
+
+def _mult_path_avec_temps(ohlcv_list, prix_initial, start_time):
+    if not ohlcv_list or not prix_initial or not start_time:
+        return []
+    bougies = sorted(ohlcv_list, key=lambda c: c[0])
+    path = []
+    for c in bougies:
+        if len(c) < 5:
+            continue
+        ts, o, h, l, cl = c[:5]
+        if not o or not h or not l or not cl:
+            continue
+        t_min = (ts - start_time) / 60
+        path.append((t_min, o / prix_initial, h / prix_initial, l / prix_initial, cl / prix_initial))
+    return path
+
+
+def _simuler_trailing_arme_be(path, sl_initial_pct, seuil_armement, trailing_pct):
+    if not path:
+        return None
+    armed = False
+    peak = None
+    for o_m, h_m, l_m, c_m in path:
+        if not armed:
+            if l_m <= (1 + sl_initial_pct):
+                return sl_initial_pct * 100
+            if h_m >= (1 + seuil_armement):
+                armed = True
+                peak = h_m
+        if armed:
+            peak = max(peak, h_m)
+            seuil_effectif = max(1.0, peak * (1 + trailing_pct))
+            if l_m <= seuil_effectif:
+                return (seuil_effectif - 1) * 100
+    return (path[-1][3] - 1) * 100
+
+
+def _simuler_reverse_dca_5050(path, sl_initial_pct, seuil_vente, trailing_pct):
+    if not path:
+        return None
+    vendu_50 = False
+    peak_reste = None
+    ret1 = seuil_vente
+    for o_m, h_m, l_m, c_m in path:
+        if not vendu_50:
+            if l_m <= (1 + sl_initial_pct):
+                return sl_initial_pct * 100
+            if h_m >= (1 + seuil_vente):
+                vendu_50 = True
+                peak_reste = h_m
+        if vendu_50:
+            peak_reste = max(peak_reste, h_m)
+            seuil_trailing = peak_reste * (1 + trailing_pct)
+            if l_m <= seuil_trailing:
+                ret2 = seuil_trailing - 1
+                return round((0.5 * ret1 + 0.5 * ret2) * 100, 4)
+    if vendu_50:
+        ret2 = path[-1][3] - 1
+        return round((0.5 * ret1 + 0.5 * ret2) * 100, 4)
+    return (path[-1][3] - 1) * 100
+
+
+def _simuler_cap_tp(path, sl_initial_pct, cap_pct):
+    if not path:
+        return None
+    for o_m, h_m, l_m, c_m in path:
+        if l_m <= (1 + sl_initial_pct):
+            return sl_initial_pct * 100
+        if h_m >= (1 + cap_pct):
+            return cap_pct * 100
+    return (path[-1][3] - 1) * 100
+
+
+def _simuler_be_echelonne(path, sl_initial_pct, paliers):
+    if not path:
+        return None
+    sl_courant = sl_initial_pct
+    for o_m, h_m, l_m, c_m in path:
+        if l_m <= (1 + sl_courant):
+            return round(sl_courant * 100, 4)
+        for seuil_gain, nouveau_sl in paliers:
+            if h_m >= (1 + seuil_gain) and nouveau_sl > sl_courant:
+                sl_courant = nouveau_sl
+    return (path[-1][3] - 1) * 100
+
+
+def _simuler_trailing_atr(path, k_atr, fenetre, sl_plancher_pct):
+    if not path:
+        return None
+    peak = 1.0
+    amplitudes = []
+    for o_m, h_m, l_m, c_m in path:
+        amplitudes.append(h_m - l_m)
+        atr = sum(amplitudes[-fenetre:]) / min(len(amplitudes), fenetre)
+        peak = max(peak, h_m)
+        seuil_trailing = max(peak - k_atr * atr, 1 + sl_plancher_pct)
+        if l_m <= seuil_trailing:
+            return (seuil_trailing - 1) * 100
+    return (path[-1][3] - 1) * 100
+
+
+def _simuler_time_exit(path_avec_temps, sl_initial_pct, max_minutes):
+    if not path_avec_temps:
+        return None
+    dernier_close = None
+    for t_min, o_m, h_m, l_m, c_m in path_avec_temps:
+        if l_m <= (1 + sl_initial_pct):
+            return sl_initial_pct * 100
+        dernier_close = c_m
+        if t_min >= max_minutes:
+            return (c_m - 1) * 100
+    return (dernier_close - 1) * 100 if dernier_close is not None else None
+
+
+def _simuler_laddering(path, sl_initial_pct, paliers, trailing_final_pct):
+    if not path:
+        return None
+    vendu = 0.0
+    gains_ponderes = 0.0
+    paliers_restants = list(paliers)
+    peak = None
+    for o_m, h_m, l_m, c_m in path:
+        if vendu == 0.0 and l_m <= (1 + sl_initial_pct):
+            return sl_initial_pct * 100
+        while paliers_restants and h_m >= (1 + paliers_restants[0][0]):
+            seuil, fraction = paliers_restants.pop(0)
+            gains_ponderes += fraction * seuil
+            vendu += fraction
+        if not paliers_restants:
+            peak = h_m if peak is None else max(peak, h_m)
+            seuil_trailing = peak * (1 + trailing_final_pct)
+            if l_m <= seuil_trailing:
+                fraction_restante = 1 - vendu
+                gains_ponderes += fraction_restante * (seuil_trailing - 1)
+                return round(gains_ponderes * 100, 4)
+    fraction_restante = 1 - vendu
+    gains_ponderes += fraction_restante * (path[-1][3] - 1)
+    return round(gains_ponderes * 100, 4)
+
+
+def simuler_strategies_avancees(ohlcv_list, prix_initial, start_time, mise_usd=MISE_SIMULATION_USD):
+    cles = ("strat_a", "strat_b", "strat_c", "strat_d", "strat_e", "strat_f", "strat_g")
+    path = _mult_path_depuis_ohlcv(ohlcv_list, prix_initial)
+    if not path:
+        return {f"{c}_pct": None for c in cles} | {f"{c}_usd": None for c in cles}
+
+    path_temps = _mult_path_avec_temps(ohlcv_list, prix_initial, start_time)
+
+    resultats = {
+        "strat_a": _simuler_trailing_arme_be(path, STRAT_A_SL_PCT, STRAT_A_SEUIL_ARMEMENT, STRAT_A_TRAILING_PCT),
+        "strat_b": _simuler_reverse_dca_5050(path, STRAT_B_SL_PCT, STRAT_B_SEUIL_VENTE, STRAT_B_TRAILING_PCT),
+        "strat_c": _simuler_cap_tp(path, STRAT_C_SL_PCT, STRAT_C_CAP_PCT),
+        "strat_d": _simuler_be_echelonne(path, STRAT_D_SL_PCT, STRAT_D_PALIERS),
+        "strat_e": _simuler_trailing_atr(path, STRAT_E_K_ATR, STRAT_E_FENETRE_BOUGIES, STRAT_E_SL_PLANCHER_PCT),
+        "strat_f": _simuler_time_exit(path_temps, STRAT_F_SL_PCT, STRAT_F_MAX_MINUTES) if path_temps else None,
+        "strat_g": _simuler_laddering(path, STRAT_G_SL_PCT, STRAT_G_PALIERS, STRAT_G_TRAILING_FINAL_PCT),
+    }
+
+    def _usd(pct):
+        return round(mise_usd * (pct / 100), 4) if pct is not None else None
+
+    sortie = {}
+    for cle, pct in resultats.items():
+        sortie[f"{cle}_pct"] = round(pct, 2) if pct is not None else None
+        sortie[f"{cle}_usd"] = _usd(pct)
+    return sortie
+
+
+# ============================================================
+# --- RAPPORT COMPARATIF DES STRATÉGIES (envoyé sur Telegram) ---
+# ============================================================
+STRATEGIES_COMPARATIF = [
+    ("sim_remb_pct", "Sortie immédiate à x2 (existant)"),
+    ("sim_ts20_pct", "Trailing 20% après x2 (existant)"),
+    ("sim_ts30_pct", "Trailing 30% après x2 (existant)"),
+    ("sim_3paliers_pct", "3 paliers pondérés (existant)"),
+    ("sim_ts_immediat_pct", "Trailing 20% immédiat (existant)"),
+    ("sim_peak_pct", "Sortie au pic exact (théorique, existant)"),
+    ("strat_a_pct", "A — Trailing armé +50% + Break-Even"),
+    ("strat_b_pct", "B — Reverse DCA 50/50"),
+    ("strat_c_pct", "C — Plafond de Take-Profit +40%"),
+    ("strat_d_pct", "D — Break-even échelonné"),
+    ("strat_e_pct", "E — Trailing volatilité (ATR approx.)"),
+    ("strat_f_pct", "F — Sortie temporelle (60 min)"),
+    ("strat_g_pct", "G — Laddering 33/33/34"),
+]
+
+COMPARATIF_CSV_FILE = "comparatif_strategies.csv"
+
+
+def generer_et_envoyer_rapport_comparatif():
+    if pd is None:
+        send_telegram_message(
+            "⚠️ Le module `pandas` n'est pas installé sur le serveur. "
+            "Ajoute `pandas` à ton requirements.txt (Railway) puis redéploie "
+            "pour activer /comparatif."
+        )
+        return
+
+    if not os.path.isfile(LOG_FILE):
+        send_telegram_message("⚠️ Aucune donnée pour le moment dans le fichier de log.")
+        return
+
+    try:
+        df = pd.read_csv(LOG_FILE)
+    except Exception as e:
+        send_telegram_message(f"⚠️ Erreur de lecture du CSV : {e}")
+        return
+
+    if "signal_valide" not in df.columns:
+        send_telegram_message("⚠️ Colonne signal_valide absente du CSV — relance le bot avec la version à jour.")
+        return
+
+    df_filtre = df[df["signal_valide"].astype(str).str.strip() == "True"].copy()
+
+    if df_filtre.empty:
+        send_telegram_message("⚠️ Aucun token n'a encore validé le critère de sélection (signal_valide=True) dans le log.")
+        return
+
+    lignes = []
+    for colonne, libelle in STRATEGIES_COMPARATIF:
+        if colonne not in df_filtre.columns:
+            continue
+        valeurs = pd.to_numeric(df_filtre[colonne], errors="coerce").dropna()
+        if valeurs.empty:
+            continue
+        lignes.append({
+            "strategie": libelle,
+            "nb_trades": int(len(valeurs)),
+            "roi_moyen_pct": round(float(valeurs.mean()), 2),
+            "roi_median_pct": round(float(valeurs.median()), 2),
+            "taux_succes_pct": round(float((valeurs > 0).sum() / len(valeurs) * 100), 1),
+        })
+
+    if not lignes:
+        send_telegram_message("⚠️ Aucune colonne de stratégie exploitable dans le CSV pour le moment.")
+        return
+
+    df_comparatif = pd.DataFrame(lignes).sort_values("roi_moyen_pct", ascending=False)
+
+    try:
+        df_comparatif.to_csv(COMPARATIF_CSV_FILE, index=False, encoding="utf-8")
+    except Exception as e:
+        send_telegram_message(f"⚠️ Erreur d'écriture du CSV comparatif : {e}")
+        return
+
+    lignes_txt = "\n".join(
+        f"• {r.strategie} — moy: {r.roi_moyen_pct:+.1f}% | méd: {r.roi_median_pct:+.1f}% | "
+        f"succès: {r.taux_succes_pct:.0f}% ({r.nb_trades} trades)"
+        for r in df_comparatif.itertuples()
+    )
+    caption = (
+        f"📊 *Comparatif des stratégies* — {len(df_filtre)} tokens ayant validé le signal d'entrée\n\n"
+        f"{lignes_txt}\n\n"
+        f"ℹ️ Basé sur les bougies minute (OHLCV) sur la fenêtre suivie — voir le CSV joint pour le détail."
+    )
+    if len(caption) > 1024:
+        send_telegram_message(caption[:4000])
+        send_telegram_document(COMPARATIF_CSV_FILE, caption="📊 Comparatif détaillé des stratégies (tableau complet)")
+    else:
+        send_telegram_document(COMPARATIF_CSV_FILE, caption=caption)
+
+    print(f"[comparatif] rapport envoyé — {len(df_filtre)} tokens, {len(lignes)} stratégies")
+
+
+# ============================================================
+# --- COMPARATIF PAR PROPOSITION DE CRITÈRES DE SÉLECTION ---
+# ============================================================
+FILTRES_PROPOSITIONS = [
+    {
+        "nom": "Actuel (signal_valide)",
+        "condition": lambda df: df["signal_valide"].astype(str).str.strip() == "True",
+    },
+    {
+        "nom": "Proposition 1 — Compromis équilibré",
+        "condition": lambda df: (
+            (pd.to_numeric(df["price_change_m3"], errors="coerce") >= 10)
+            & (pd.to_numeric(df["ventes_m5"], errors="coerce") >= 100)
+            & (pd.to_numeric(df["max_drawdown_before_peak"], errors="coerce") >= -50)
+        ),
+    },
+    {
+        "nom": "Proposition 2 — Approche large",
+        "condition": lambda df: (
+            (pd.to_numeric(df["price_change_m3"], errors="coerce") >= 5)
+            & (pd.to_numeric(df["ventes_m5"], errors="coerce") >= 75)
+            & (pd.to_numeric(df["max_drawdown_before_peak"], errors="coerce") >= -50)
+        ),
+    },
+    {
+        "nom": "Proposition 3 — Filtre très souple",
+        "condition": lambda df: (
+            (pd.to_numeric(df["price_change_m3"], errors="coerce") >= 0)
+            & (pd.to_numeric(df["ventes_m5"], errors="coerce") >= 50)
+            & (pd.to_numeric(df["max_drawdown_before_peak"], errors="coerce") >= -60)
+        ),
+    },
+]
+
+STRATEGIE_MISE_EN_AVANT = ("sim_3paliers_pct", "3 paliers pondérés")
+
+PROPOSITIONS_CSV_FILE = "comparatif_propositions.csv"
+
+COLONNES_REQUISES_PROPOSITIONS = (
+    "signal_valide", "price_change_m3", "ventes_m5", "max_drawdown_before_peak",
+)
+
+
+def generer_et_envoyer_rapport_propositions():
+    if pd is None:
+        send_telegram_message(
+            "⚠️ Le module `pandas` n'est pas installé sur le serveur. "
+            "Ajoute `pandas` à ton requirements.txt (Railway) puis redéploie "
+            "pour activer /propositions."
+        )
+        return
+
+    if not os.path.isfile(LOG_FILE):
+        send_telegram_message("⚠️ Aucune donnée pour le moment dans le fichier de log.")
+        return
+
+    try:
+        df = pd.read_csv(LOG_FILE)
+    except Exception as e:
+        send_telegram_message(f"⚠️ Erreur de lecture du CSV : {e}")
+        return
+
+    colonnes_manquantes = [c for c in COLONNES_REQUISES_PROPOSITIONS if c not in df.columns]
+    if colonnes_manquantes:
+        send_telegram_message(
+            f"⚠️ Colonnes manquantes dans le CSV : {', '.join(colonnes_manquantes)} — "
+            "relance le bot avec la version à jour pour qu'elles soient journalisées."
+        )
+        return
+
+    lignes_csv = []
+    resumes_msg = []
+
+    for proposition in FILTRES_PROPOSITIONS:
+        try:
+            masque = proposition["condition"](df)
+        except Exception as e:
+            resumes_msg.append(f"⚠️ {proposition['nom']} — erreur de filtrage : {e}")
+            continue
+
+        sous_ensemble = df[masque.fillna(False)]
+        nb_tokens = len(sous_ensemble)
+
+        if nb_tokens == 0:
+            resumes_msg.append(f"*{proposition['nom']}* — 0 token éligible")
+            continue
+
+        stats_par_strategie = {}
+        for colonne, libelle in STRATEGIES_COMPARATIF:
+            if colonne not in sous_ensemble.columns:
+                continue
+            valeurs = pd.to_numeric(sous_ensemble[colonne], errors="coerce").dropna()
+            if valeurs.empty:
+                continue
+            stats = {
+                "roi_moyen_pct": round(float(valeurs.mean()), 2),
+                "roi_median_pct": round(float(valeurs.median()), 2),
+                "taux_succes_pct": round(float((valeurs > 0).sum() / len(valeurs) * 100), 1),
+            }
+            stats_par_strategie[colonne] = stats
+            lignes_csv.append({
+                "proposition": proposition["nom"],
+                "nb_tokens_eligibles": nb_tokens,
+                "strategie": libelle,
+                **stats,
+            })
+
+        colonne_avant, libelle_avant = STRATEGIE_MISE_EN_AVANT
+        if colonne_avant in stats_par_strategie:
+            s = stats_par_strategie[colonne_avant]
+            resumes_msg.append(
+                f"*{proposition['nom']}* — {nb_tokens} tokens éligibles\n"
+                f"  {libelle_avant} : moy {s['roi_moyen_pct']:+.1f}% | méd {s['roi_median_pct']:+.1f}% | "
+                f"succès {s['taux_succes_pct']:.0f}%"
+            )
+        else:
+            resumes_msg.append(f"*{proposition['nom']}* — {nb_tokens} tokens éligibles (pas de données '{libelle_avant}')")
+
+    if not lignes_csv:
+        send_telegram_message(
+            "⚠️ Aucune proposition n'a trouvé de token éligible avec au moins une stratégie exploitable."
+        )
+        return
+
+    try:
+        pd.DataFrame(lignes_csv).to_csv(PROPOSITIONS_CSV_FILE, index=False, encoding="utf-8")
+    except Exception as e:
+        send_telegram_message(f"⚠️ Erreur d'écriture du CSV : {e}")
+        return
+
+    caption = (
+        "📊 *Comparatif par proposition de critères de sélection*\n\n"
+        + "\n\n".join(resumes_msg)
+        + "\n\nℹ️ CSV joint : détail complet (toutes les stratégies) pour chaque proposition."
+    )
+    if len(caption) > 1024:
+        send_telegram_message(caption[:4000])
+        send_telegram_document(PROPOSITIONS_CSV_FILE, caption="📊 Comparatif détaillé par proposition (tableau complet)")
+    else:
+        send_telegram_document(PROPOSITIONS_CSV_FILE, caption=caption)
+
+    print(f"[propositions] rapport envoyé — {len(FILTRES_PROPOSITIONS)} propositions comparées")
+
+
 def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
@@ -518,8 +988,11 @@ def send_telegram_message(message):
         r = requests.post(url, json=payload, timeout=5)
         if r.status_code != 200:
             print(f"Erreur Telegram ({r.status_code}) : {r.text}")
+            return False
+        return True
     except Exception as e:
         print(f"Erreur d'envoi Telegram : {e}")
+        return False
 
 
 def send_telegram_document(filepath, caption=None):
@@ -568,13 +1041,26 @@ def check_telegram_commands():
 
         if text in ("/csv", "/log", "/download"):
             send_telegram_document(LOG_FILE, caption="📊 Historique complet des tokens suivis")
+        elif text in ("/csv_signaux", "/signaux", "/log_signaux"):
+            send_telegram_document(SIGNAUX_LOG_FILE, caption="🎯 Historique des signaux 1/2/3/4 déclenchés (trailing stop simulé)")
         elif text in ("/csv_dextools", "/log_dextools"):
             send_telegram_document(DEXTOOLS_LOG_FILE, caption="📊 Historique canal DexToolsPublic (multiplicateur alerte → ATH 24h)")
+        elif text in ("/comparatif", "/strategies", "/rapport_strategies"):
+            generer_et_envoyer_rapport_comparatif()
+        elif text in ("/propositions", "/filtres"):
+            generer_et_envoyer_rapport_propositions()
         elif text == "/help":
             send_telegram_message(
                 "Commandes disponibles :\n"
-                "/csv — télécharger le fichier de log complet\n"
-                "/csv_dextools — télécharger le suivi du canal DexToolsPublic"
+                "/csv — télécharger le fichier de log complet (tous les tokens suivis)\n"
+                "/csv_signaux — télécharger l'historique des signaux 1/2/3/4 déclenchés, "
+                "avec le résultat des 3 trailing stops comparés (-25% / -30% / -40%)\n"
+                "/csv_dextools — télécharger le suivi du canal DexToolsPublic\n"
+                "/comparatif — comparatif ROI moyen / médian / taux de succès de toutes les stratégies "
+                "(A à G + anciennes), calculé uniquement sur les tokens ayant validé le signal d'entrée\n"
+                "/propositions — compare le filtre actuel à 3 propositions de critères de sélection plus "
+                "souples (price_change_m3, ventes_m5, max_drawdown_before_peak), avec le nombre de tokens "
+                "éligibles et le ROI par stratégie pour chacune"
             )
 
 
@@ -585,7 +1071,17 @@ def fetch_pair_data(mint):
         if res.status_code != 200:
             return None
         pairs = res.json().get("pairs")
-        return pairs[0] if pairs else None
+        if not pairs:
+            return None
+        # DexScreener peut retourner des paires sur PLUSIEURS chaînes pour
+        # une même adresse si celle-ci "collisionne" avec un autre réseau.
+        # On ne garde QUE les paires Solana, puis la plus liquide d'entre
+        # elles — jamais la première paire brute retournée par l'API.
+        pairs_solana = [p for p in pairs if p and p.get("chainId") == CHAIN_ID_SOLANA]
+        if not pairs_solana:
+            return None
+        pairs_solana.sort(key=lambda p: (p.get("liquidity") or {}).get("usd", 0) or 0, reverse=True)
+        return pairs_solana[0]
     except Exception as e:
         print(f"[fetch_pair_data] erreur pour {mint} : {e}")
         return None
@@ -809,6 +1305,15 @@ def analyser_20_premieres_secondes(mint):
         else:
             active_tokens[mint]["position_statut"] = "signal_non_valide"
 
+        # --- Signal 3 (entrée à 30s) : buy_ratio_20s vient d'être calculé.
+        # Si l'âge du token dépasse déjà 30s (peu probable ici mais possible
+        # en cas de retard), on tente l'évaluation immédiatement ; sinon
+        # c'est analyser_metriques_etendues() qui la déclenchera à t=30s.
+        evaluer_signal3_si_pret(mint)
+        # --- Signal LP light (entrée à 30s, sans filtre qualité) : même
+        # logique de retry que le Signal 3 ci-dessus.
+        evaluer_signal_lp_light_si_pret(mint)
+
     print(
         f"[analyse_20s] {data['symbol']} ({mint}) — "
         f"buy_ratio_2s={buy_ratio_2s} buy_ratio_5s={buy_ratio_5s} buy_ratio_10s={buy_ratio_10s} "
@@ -818,6 +1323,487 @@ def analyser_20_premieres_secondes(mint):
 
 METRIQUES_ETENDUES_DUREE = 180
 METRIQUES_ETENDUES_INTERVAL = 5
+
+
+# ============================================================
+# --- SIGNAUX 1, 2, 3, 4 : entrée simulée + alerte Telegram + trailing stop ---
+# ============================================================
+# Règles communes à tous les signaux : pas de TP plafonné — le stop suit le
+# prix (trailing) et remonte à chaque nouveau plus haut. On compare 3
+# distances de trailing en parallèle sur chaque signal : -25% / -30% / -40%.
+SIGNAUX_SL_PCT = -0.25
+SIGNAUX_MAX_HOLD_MINUTES = 30
+SIGNAUX_MISE_USD = MISE_SIMULATION_USD  # mise fictive $100, comme les autres simulations
+
+SIGNAUX_TRAILING_VARIANTS = {
+    "trail25": -0.25,
+    "trail30": -0.30,
+    "trail40": -0.40,
+}
+
+# Signal 1 : price_change_m3 ÷ avg_order_size_sol >= 24.2 — entrée à 3 min
+SIGNAL1_MC_MIN = 10000
+SIGNAL1_BUY_RATIO_20S_MIN = 0.55
+SIGNAL1_SEUIL = 24.2
+
+# Signal 2 : score_rugcheck × price_change_m3 >= 15.3 — entrée à 3 min
+SIGNAL2_MC_MIN = 20000
+SIGNAL2_BUY_RATIO_20S_MIN = 0.55
+SIGNAL2_SEUIL = 15.3
+
+# Signal 3 : lp_locked_pct ÷ mult_30s <= 95.6 — entrée à 30 secondes
+# (filtres qualité : mc_initial >= 40 000$ + buy_ratio_20s >= 0.63)
+SIGNAL3_MC_MIN = 40000
+SIGNAL3_BUY_RATIO_20S_MIN = 0.63
+SIGNAL3_SEUIL = 95.6
+
+# Signal LP light : MÊME formule que Signal 3 (lp_locked_pct ÷ mult_30s
+# <= 95.6, entrée à 30 secondes), mais SANS AUCUN filtre qualité
+# (ni mc_initial, ni buy_ratio_20s). Signal indépendant : peut se
+# déclencher même quand Signal 3 est rejeté par ses filtres.
+SIGNAL_LP_LIGHT_SEUIL = 95.6
+
+# Anti-doublon : (mint, cle_signal) déjà écrit dans SIGNAUX_LOG_FILE
+signaux_traites = set()
+
+
+def _lien_dexscreener(mint):
+    return f"https://dexscreener.com/solana/{mint}"
+
+
+def _lien_axiom(mint):
+    return f"https://axiom.trade/meme/{mint}"
+
+
+def _echapper_markdown(texte):
+    """Échappe les caractères qui cassent le parse_mode='Markdown' de
+    Telegram (_ * ` [) quand ils apparaissent dans du texte dynamique
+    (symbole de token, dex...) inséré au milieu d'un message formaté.
+    Sans ça, un symbole ou un texte contenant un nombre impair de ces
+    caractères fait échouer l'envoi ENTIER du message, silencieusement
+    (erreur 400 "can't parse entities", visible seulement dans les logs)."""
+    if texte is None:
+        return texte
+    texte = str(texte)
+    for car in ("_", "*", "`", "["):
+        texte = texte.replace(car, f"\\{car}")
+    return texte
+
+
+def ouvrir_position_signal(mint, cle, nom_signal, formule_txt, valeur_calculee, seuil_txt, current_mc):
+    """Ouvre une position simulée pour un signal donné (si pas déjà ouverte)
+    et envoie immédiatement l'alerte Telegram correspondante, avec l'adresse
+    du token en bloc copiable (tap-to-copy sur Telegram).
+
+    Chaque position suit 3 variantes de trailing stop en parallèle
+    (-25% / -30% / -40% depuis le plus haut observé), actives dès l'entrée
+    (pas de seuil d'activation, pas de take-profit plafonné)."""
+    data = active_tokens.get(mint)
+    if not data or not current_mc:
+        return
+
+    positions = data.setdefault("positions", {})
+    if cle in positions:
+        return  # déjà ouverte, garde-fou anti-doublon
+
+    entry_price = current_mc
+
+    trailing = {}
+    for var_cle, pct in SIGNAUX_TRAILING_VARIANTS.items():
+        trailing[var_cle] = {
+            "peak": entry_price,
+            "sl": entry_price * (1 + pct),
+            "statut": "ouverte",
+            "resultat_pct": None,
+            "resultat_usd": None,
+        }
+
+    positions[cle] = {
+        "nom": nom_signal,
+        "entry_price": entry_price,
+        "entry_time": time.time(),
+        "entry_elapsed_s": round(time.time() - data["start_time"]),
+        "formule_txt": formule_txt,
+        "valeur_calculee": valeur_calculee,
+        "seuil_txt": seuil_txt,
+        "trailing": trailing,
+    }
+
+    print(f"[{cle}] {data['symbol']} ({mint}) — signal déclenché, position ouverte à ${entry_price:,.0f} (trailing 25/30/40%)")
+
+    variantes_txt = " / ".join(
+        f"{int(abs(pct) * 100)}%" for pct in SIGNAUX_TRAILING_VARIANTS.values()
+    )
+
+    # Âge réel du pool au moment où LE SIGNAL se déclenche (pas au moment
+    # de la détection initiale du token) : âge du pool à la détection +
+    # temps écoulé depuis le début du suivi jusqu'à l'entrée du signal.
+    pool_age_txt = "N/A"
+    pool_age_detection = data.get("pool_age_seconds")
+    entry_elapsed_s = round(time.time() - data["start_time"])
+    if pool_age_detection is not None:
+        age_total_s = pool_age_detection + entry_elapsed_s
+        minutes, secondes = divmod(age_total_s, 60)
+        pool_age_txt = f"{minutes}m{secondes:02d}s"
+
+    lignes = [
+        f"🎯 *{nom_signal} déclenché !*",
+        "",
+        f"🪙 Token : {_echapper_markdown(data['symbol'])}",
+        f"🏦 DEX : {_echapper_markdown(data.get('dex'))}",
+        f"🕒 Âge du pool à l'alerte : {pool_age_txt}",
+        f"📊 Formule : `{formule_txt}` = {valeur_calculee} (seuil {seuil_txt})",
+        f"💰 MC entrée (simulée) : ${entry_price:,.0f}",
+        f"📈 Trailing stop simulé (3 variantes comparées) : {variantes_txt} depuis le plus haut",
+        "",
+        "📋 *Adresse du token (appuyer pour copier)* :",
+        f"`{mint}`",
+        "",
+        f"🔗 [DexScreener]({_lien_dexscreener(mint)})",
+        f"⚡ [Trader sur Axiom]({_lien_axiom(mint)})",
+    ]
+    envoye = send_telegram_message("\n".join(lignes))
+    if envoye:
+        print(f"[{cle}] {data['symbol']} ({mint}) — !!! ALERTE TELEGRAM ENVOYÉE AVEC SUCCÈS !!!")
+    else:
+        print(f"[{cle}] {data['symbol']} ({mint}) — !!! ÉCHEC ENVOI ALERTE TELEGRAM, voir erreur juste au-dessus !!!")
+
+
+def evaluer_signal3_si_pret(mint):
+    """Signal 3 : lp_locked_pct ÷ mult_30s <= 95.6, entrée à 30s, AVEC
+    filtres qualité (mc_initial >= 40 000$ + buy_ratio_20s >= 0.63).
+    Peut être appelée plusieurs fois (depuis analyse_20s puis
+    metriques_etendues) ; ne s'exécute réellement qu'une fois toutes les
+    données nécessaires disponibles, et ne se déclenche qu'une seule fois
+    par token."""
+    data = active_tokens.get(mint)
+    if not data or data.get("signal3_evalue"):
+        return
+
+    buy_ratio_20s = data.get("buy_ratio_20s")
+    mult_30s = data.get("mult_30s")
+    lp_locked_pct = data.get("lp_locked_pct")
+    mc_initial = data.get("initial_mc")
+
+    # Données pas encore toutes disponibles -> on retentera au prochain appel
+    if buy_ratio_20s is None or not mult_30s or lp_locked_pct is None:
+        return
+
+    data["signal3_evalue"] = True
+
+    if not mc_initial or mc_initial < SIGNAL3_MC_MIN:
+        print(f"[signal3] {data['symbol']} ({mint}) rejeté — mc_initial=${mc_initial}")
+        return
+    if buy_ratio_20s < SIGNAL3_BUY_RATIO_20S_MIN:
+        print(f"[signal3] {data['symbol']} ({mint}) rejeté — buy_ratio_20s={buy_ratio_20s}")
+        return
+
+    valeur = round(lp_locked_pct / mult_30s, 3)
+    if valeur > SIGNAL3_SEUIL:
+        print(f"[signal3] {data['symbol']} ({mint}) rejeté — lp_locked_pct/mult_30s={valeur}")
+        return
+
+    pair = fetch_pair_data(mint)
+    current_mc = (pair.get("marketCap", 0) or pair.get("fdv", 0)) if pair else None
+    if not current_mc:
+        current_mc = (data.get("initial_mc") or 1.0) * mult_30s
+
+    ouvrir_position_signal(
+        mint, "signal3", "Signal 3",
+        "lp_locked_pct ÷ mult_30s", valeur, f"≤ {SIGNAL3_SEUIL}",
+        current_mc,
+    )
+
+
+def evaluer_signal_lp_light_si_pret(mint):
+    """Signal LP light : lp_locked_pct ÷ mult_30s <= 95.6, entrée à 30s,
+    SANS AUCUN filtre qualité (ni mc_initial, ni buy_ratio_20s) —
+    uniquement la condition brute. Signal indépendant de Signal 3 : les
+    deux peuvent se déclencher (ou pas) chacun de leur côté sur le même
+    token, puisqu'ils ouvrent des positions simulées distinctes
+    ("signal3" vs "signal_lp_light")."""
+    data = active_tokens.get(mint)
+    if not data or data.get("signal_lp_light_evalue"):
+        return
+
+    mult_30s = data.get("mult_30s")
+    lp_locked_pct = data.get("lp_locked_pct")
+
+    # Données pas encore disponibles -> on retentera au prochain appel
+    if not mult_30s or lp_locked_pct is None:
+        return
+
+    data["signal_lp_light_evalue"] = True
+
+    valeur = round(lp_locked_pct / mult_30s, 3)
+    if valeur > SIGNAL_LP_LIGHT_SEUIL:
+        print(f"[signal_lp_light] {data['symbol']} ({mint}) rejeté — lp_locked_pct/mult_30s={valeur}")
+        return
+
+    pair = fetch_pair_data(mint)
+    current_mc = (pair.get("marketCap", 0) or pair.get("fdv", 0)) if pair else None
+    if not current_mc:
+        current_mc = (data.get("initial_mc") or 1.0) * mult_30s
+
+    ouvrir_position_signal(
+        mint, "signal_lp_light", "Signal LP light (sans filtre)",
+        "lp_locked_pct ÷ mult_30s", valeur, f"≤ {SIGNAL_LP_LIGHT_SEUIL}",
+        current_mc,
+    )
+
+
+def evaluer_signaux_1_et_2(mint, price_change_m3, mc_reference):
+    """Signaux 1 et 2, tous deux évalués à 3 minutes. Indépendants l'un de
+    l'autre : les deux peuvent se déclencher sur le même token."""
+    data = active_tokens.get(mint)
+    if not data or data.get("signaux_1_2_evalues"):
+        return
+    data["signaux_1_2_evalues"] = True
+
+    if price_change_m3 is None:
+        print(f"[signal1/2] {data['symbol']} ({mint}) — price_change_m3 indisponible, signaux ignorés")
+        return
+
+    entry_stats = data.get("entry_stats", {})
+    buy_ratio_20s = data.get("buy_ratio_20s")
+    mc_initial = data.get("initial_mc")
+    avg_order_size_sol = entry_stats.get("avg_order_size_sol")
+    score_rugcheck = data.get("rugcheck_score")
+    current_mc = mc_reference or data.get("initial_mc")
+
+    # --- Signal 1 : price_change_m3 ÷ avg_order_size_sol >= 24.2 ---
+    if (
+        mc_initial and mc_initial >= SIGNAL1_MC_MIN
+        and buy_ratio_20s is not None and buy_ratio_20s >= SIGNAL1_BUY_RATIO_20S_MIN
+        and avg_order_size_sol
+    ):
+        valeur1 = round(price_change_m3 / avg_order_size_sol, 3)
+        if valeur1 >= SIGNAL1_SEUIL:
+            ouvrir_position_signal(
+                mint, "signal1", "Signal 1",
+                "price_change_m3 ÷ avg_order_size_sol", valeur1, f"≥ {SIGNAL1_SEUIL}",
+                current_mc,
+            )
+        else:
+            print(f"[signal1] {data['symbol']} ({mint}) rejeté — valeur={valeur1}")
+    else:
+        print(
+            f"[signal1] {data['symbol']} ({mint}) filtres non remplis "
+            f"(mc_initial={mc_initial}, buy_ratio_20s={buy_ratio_20s}, avg_order_size_sol={avg_order_size_sol})"
+        )
+
+    # --- Signal 2 : score_rugcheck × price_change_m3 >= 15.3 ---
+    if (
+        mc_initial and mc_initial >= SIGNAL2_MC_MIN
+        and buy_ratio_20s is not None and buy_ratio_20s >= SIGNAL2_BUY_RATIO_20S_MIN
+        and score_rugcheck is not None
+    ):
+        valeur2 = round(score_rugcheck * price_change_m3, 3)
+        if valeur2 >= SIGNAL2_SEUIL:
+            ouvrir_position_signal(
+                mint, "signal2", "Signal 2",
+                "score_rugcheck × price_change_m3", valeur2, f"≥ {SIGNAL2_SEUIL}",
+                current_mc,
+            )
+        else:
+            print(f"[signal2] {data['symbol']} ({mint}) rejeté — valeur={valeur2}")
+    else:
+        print(
+            f"[signal2] {data['symbol']} ({mint}) filtres non remplis "
+            f"(mc_initial={mc_initial}, buy_ratio_20s={buy_ratio_20s}, score_rugcheck={score_rugcheck})"
+        )
+
+
+def gerer_positions_signaux(mint, current_mc):
+    """Appelée à chaque cycle de prix (comme gerer_simulation_position) :
+    met à jour le pic de chaque variante de trailing et clôture celles dont
+    le prix repasse sous leur stop glissant (peu importe le pic, pas de TP)."""
+    data = active_tokens.get(mint)
+    if not data or not current_mc:
+        return
+    positions = data.get("positions") or {}
+    for cle, pos in positions.items():
+        entry_price = pos["entry_price"]
+        for var_cle, pct in SIGNAUX_TRAILING_VARIANTS.items():
+            tv = pos["trailing"][var_cle]
+            if tv["statut"] != "ouverte":
+                continue
+            if current_mc > tv["peak"]:
+                tv["peak"] = current_mc
+                tv["sl"] = tv["peak"] * (1 + pct)
+            if current_mc <= tv["sl"]:
+                tv["statut"] = "trailing_stop"
+                tv["resultat_pct"] = round((tv["sl"] / entry_price - 1) * 100, 2)
+                tv["resultat_usd"] = round(SIGNAUX_MISE_USD * (tv["resultat_pct"] / 100), 2)
+                print(
+                    f"[{cle}/{var_cle}] {data['symbol']} ({mint}) — trailing stop touché, "
+                    f"position clôturée ({tv['resultat_pct']:+.1f}%)"
+                )
+
+
+def cloturer_positions_signaux_expirees(mint, max_mc):
+    """Appelée à l'expiration des 30 minutes de suivi du token : toute
+    variante de trailing encore ouverte est clôturée au meilleur prix
+    observé (pic de polling ou ATH réel via GeckoTerminal, le plus élevé
+    des deux)."""
+    data = active_tokens.get(mint)
+    if not data:
+        return
+    positions = data.get("positions") or {}
+    for cle, pos in positions.items():
+        entry_price = pos["entry_price"]
+        for var_cle in SIGNAUX_TRAILING_VARIANTS:
+            tv = pos["trailing"][var_cle]
+            if tv["statut"] != "ouverte":
+                continue
+            sortie = max(tv.get("peak", entry_price), max_mc or 0)
+            tv["statut"] = "expire_30min"
+            tv["resultat_pct"] = round((sortie / entry_price - 1) * 100, 2)
+            tv["resultat_usd"] = round(SIGNAUX_MISE_USD * (tv["resultat_pct"] / 100), 2)
+            print(
+                f"[{cle}/{var_cle}] {data['symbol']} ({mint}) — expiration 30min, "
+                f"résultat {tv['resultat_pct']:+.1f}%"
+            )
+
+
+SIGNAUX_LOG_FILE = "signaux_log.csv"
+
+# --- Colonnes existantes : NE JAMAIS RIEN CHANGER ICI (ordre, noms) ---
+SIGNAUX_LOG_FIELDS_EXISTANTES = [
+    "horodatage", "mint", "symbole", "signal",
+    "formule", "valeur_calculee", "seuil",
+    "mc_initial_token", "mc_entree", "entree_a_s",
+    "trail25_statut", "trail25_resultat_pct", "trail25_resultat_usd",
+    "trail30_statut", "trail30_resultat_pct", "trail30_resultat_usd",
+    "trail40_statut", "trail40_resultat_pct", "trail40_resultat_usd",
+    "buy_ratio_20s", "score_rugcheck", "avg_order_size_sol",
+    "lp_locked_pct", "mult_30s",
+    "lien_dexscreener", "lien_axiom",
+]
+
+# --- Nouvelles colonnes ajoutées à la suite, préfixées pour rester
+# explicites (rien de ce qui précède n'est modifié) :
+#   avant__*  -> connues AU MOMENT du signal, utilisables comme variables
+#                explicatives pour analyser ce qui prédit un bon trail25/30/40.
+#   apres__*  -> calculées a posteriori sur toute la fenêtre de 30 min
+#                (mc_max, simulations, time_to_peak, etc.). Ce sont des
+#                résultats, pas des prédicteurs : utiles pour comparer des
+#                stratégies de sortie, jamais pour "expliquer" le signal.
+AVANT_KEYS = [
+    "dex", "mc_initial", "liquidite_usd", "ratio_liquidite",
+    "alertes_rugcheck", "pct_top10_holders", "insiders_detectes",
+    "nombre_holders", "bundle_detecte", "pool_age_seconds", "pool_age_minutes",
+    "achats_m5", "ventes_m5", "volume_m5", "achats_h1", "ventes_h1", "volume_h1",
+    "buy_ratio_10s", "buy_ratio_2s", "buy_ratio_5s", "buy_ratio_1m", "buy_ratio_diag",
+    "achats_bruts_2s", "achats_10s", "ventes_10s", "achats_m1",
+    "price_change_m5", "price_change_m1", "price_change_m3",
+    "tx_accel", "tx_velocity_5s", "max_tx_per_second",
+    "boost_detecte", "nombre_boosts_actifs",
+    "unique_buyers_count", "volume_m1", "ratio_volume_m1_m5",
+    "ratio_achats_m1_m5", "buy_tx_ratio_m5",
+    "mult_10s", "mult_1m", "ratio_liquidite_mc", "sell_ratio_1m",
+    "is_golden_window", "signal_valide", "buy_ratio_source",
+    "seconde_prix_plus_bas_20s", "multiplicateur_plus_bas_20s",
+    "profil_dexscreener", "site_web", "twitter", "telegram",
+]
+
+APRES_KEYS = [
+    "mc_max", "multiplicateur", "position_statut", "resultat_pct_simule",
+    "time_to_2x", "time_to_3x", "max_drawdown_before_peak",
+    "time_to_peak", "time_to_max_drawdown", "vitesse_chute_pct_par_min",
+    "sim_remb_pct", "sim_remb_usd", "sim_ts20_pct", "sim_ts20_usd",
+    "sim_ts30_pct", "sim_ts30_usd", "sim_3paliers_pct", "sim_3paliers_usd",
+    "sim_ts_immediat_pct", "sim_ts_immediat_usd", "sim_peak_pct", "sim_peak_usd",
+    "strat_a_pct", "strat_a_usd", "strat_b_pct", "strat_b_usd",
+    "strat_c_pct", "strat_c_usd", "strat_d_pct", "strat_d_usd",
+    "strat_e_pct", "strat_e_usd", "strat_f_pct", "strat_f_usd",
+    "strat_g_pct", "strat_g_usd",
+]
+
+SIGNAUX_LOG_FIELDS = (
+    SIGNAUX_LOG_FIELDS_EXISTANTES
+    + ["horodatage_fin_suivi"]
+    + [f"avant__{k}" for k in AVANT_KEYS]
+    + [f"apres__{k}" for k in APRES_KEYS]
+)
+
+
+def log_resultat_signal_csv(row):
+    try:
+        file_existe = os.path.isfile(SIGNAUX_LOG_FILE)
+        with open(SIGNAUX_LOG_FILE, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=SIGNAUX_LOG_FIELDS)
+            if not file_existe:
+                writer.writeheader()
+            writer.writerow(row)
+    except Exception as e:
+        print(f"[log_resultat_signal_csv] erreur : {e}")
+
+
+def log_resultats_signaux(mint, data, max_mc, row_rapport=None):
+    """Écrit une ligne dans SIGNAUX_LOG_FILE pour chaque signal qui s'est
+    déclenché sur ce token (signal1, signal2, signal3, signal_lp_light),
+    avec le résultat des 3 variantes de trailing stop comparées
+    (-25% / -30% / -40%). Les colonnes lp_locked_pct et mult_30s sont des
+    métriques au niveau du token, déjà journalisées pour chaque ligne
+    (utile en particulier pour signal3 / signal_lp_light).
+
+    Les 26 colonnes existantes (SIGNAUX_LOG_FIELDS_EXISTANTES) restent
+    inchangées. Si row_rapport est fourni (le dict déjà construit pour
+    token_log.csv au même instant), les colonnes avant__/apres__ du
+    rapport sont ajoutées à la SUITE, sur la même ligne."""
+    positions = data.get("positions") or {}
+    entry_stats = data.get("entry_stats", {})
+    for cle, pos in positions.items():
+        cle_unique = (mint, cle)
+        if cle_unique in signaux_traites:
+            continue
+        signaux_traites.add(cle_unique)
+
+        trailing = pos.get("trailing", {})
+        t25 = trailing.get("trail25", {})
+        t30 = trailing.get("trail30", {})
+        t40 = trailing.get("trail40", {})
+
+        row_signal = {
+            "horodatage": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "mint": mint,
+            "symbole": data.get("symbol"),
+            "signal": pos.get("nom"),
+            "formule": pos.get("formule_txt"),
+            "valeur_calculee": pos.get("valeur_calculee"),
+            "seuil": pos.get("seuil_txt"),
+            "mc_initial_token": data.get("initial_mc"),
+            "mc_entree": pos.get("entry_price"),
+            "entree_a_s": pos.get("entry_elapsed_s"),
+            "trail25_statut": t25.get("statut"),
+            "trail25_resultat_pct": t25.get("resultat_pct"),
+            "trail25_resultat_usd": t25.get("resultat_usd"),
+            "trail30_statut": t30.get("statut"),
+            "trail30_resultat_pct": t30.get("resultat_pct"),
+            "trail30_resultat_usd": t30.get("resultat_usd"),
+            "trail40_statut": t40.get("statut"),
+            "trail40_resultat_pct": t40.get("resultat_pct"),
+            "trail40_resultat_usd": t40.get("resultat_usd"),
+            "buy_ratio_20s": data.get("buy_ratio_20s"),
+            "score_rugcheck": data.get("rugcheck_score"),
+            "avg_order_size_sol": entry_stats.get("avg_order_size_sol"),
+            "lp_locked_pct": data.get("lp_locked_pct"),
+            "mult_30s": data.get("mult_30s"),
+            "lien_dexscreener": data.get("dex_url"),
+            "lien_axiom": _lien_axiom(mint),
+        }
+
+        if row_rapport is not None:
+            row_signal["horodatage_fin_suivi"] = row_rapport.get("horodatage")
+            for k in AVANT_KEYS:
+                row_signal[f"avant__{k}"] = row_rapport.get(k)
+            for k in APRES_KEYS:
+                row_signal[f"apres__{k}"] = row_rapport.get(k)
+
+        log_resultat_signal_csv(row_signal)
+    if positions:
+        print(f"[signaux_log] {len(positions)} position(s) journalisée(s) pour {mint}")
 
 
 def analyser_metriques_etendues(mint):
@@ -850,6 +1836,23 @@ def analyser_metriques_etendues(mint):
         if mc and mint in active_tokens and mc < active_tokens[mint].get("min_price", mc):
             active_tokens[mint]["min_price"] = mc
             active_tokens[mint]["min_price_time"] = elapsed
+
+        # --- Signal 3 / Signal LP light (entrée à 30s) : dès qu'on atteint
+        # ~30s d'âge, on calcule mult_30s en direct (mc actuel / mc initial)
+        # et on tente l'évaluation des deux signaux (ne se déclenchent que
+        # si toutes les données nécessaires sont là).
+        if elapsed >= 30 and mint in active_tokens and not active_tokens[mint].get("mult_30s"):
+            if mc:
+                active_tokens[mint]["mult_30s"] = round(mc / initial_mc, 4)
+            evaluer_signal3_si_pret(mint)
+            evaluer_signal_lp_light_si_pret(mint)
+
+        # --- Signaux 1 & 2 (entrée à 3min) : dès que la fenêtre des 3
+        # minutes (180s) est atteinte, on évalue immédiatement, sans
+        # attendre la fin de la boucle de 180s de collecte de métriques.
+        if elapsed >= 180 and initial_price and price_usd and mint in active_tokens and not active_tokens[mint].get("signaux_1_2_evalues"):
+            price_change_m3_instant = round((price_usd / initial_price - 1) * 100, 2)
+            evaluer_signaux_1_et_2(mint, price_change_m3_instant, mc)
 
         prochain_t += METRIQUES_ETENDUES_INTERVAL
         if mint not in active_tokens:
@@ -938,19 +1941,35 @@ def analyser_metriques_etendues(mint):
             "ratio_achats_m1_m5": ratio_achats_m1_m5,
             "buy_tx_ratio_m5": buy_tx_ratio_m5,
             "mult_10s": mult_10s,
-            "mult_30s": mult_30s,
+            # mult_30s a déjà pu être défini en direct plus haut dans la
+            # boucle ; on ne l'écrase que s'il n'existe pas encore.
+            "mult_30s": active_tokens[mint].get("mult_30s") or mult_30s,
             "mult_1m": mult_1m,
             "max_tx_per_second": round(max_tx_par_seconde, 2),
         })
 
+    # Filet de sécurité : si les fenêtres 30s / 180s n'ont pas déclenché
+    # l'évaluation en cours de route (ex: donnée absente à ce moment
+    # précis), on l'exécute ici avec les valeurs finales calculées.
+    evaluer_signal3_si_pret(mint)
+    evaluer_signal_lp_light_si_pret(mint)
+    evaluer_signaux_1_et_2(mint, price_change_m3, _valeur_au_plus_proche(180, 1))
+
     print(
         f"[metriques_etendues] {data.get('symbol')} ({mint}) — "
-        f"mult_10s={mult_10s} mult_30s={mult_30s} mult_1m={mult_1m} "
+        f"mult_10s={mult_10s} mult_30s={active_tokens.get(mint, {}).get('mult_30s')} mult_1m={mult_1m} "
         f"buy_ratio_1m={buy_ratio_1m} price_change_m1={price_change_m1}"
     )
 
 
 def essayer_alerter(mint, pair, source_url):
+    # Garde-fou final avant toute alerte : on ne traite jamais une paire
+    # qui ne serait pas explicitement sur Solana, même si elle a été
+    # transmise par erreur par une source amont.
+    if not pair or pair.get("chainId") != CHAIN_ID_SOLANA:
+        print(f"[non solana] {mint} — chainId={pair.get('chainId') if pair else None}, ignoré")
+        return False
+
     base_token = pair.get("baseToken") or {}
     name = base_token.get("name", "Inconnu")
     symbol = base_token.get("symbol", "Inconnu")
@@ -981,11 +2000,12 @@ def essayer_alerter(mint, pair, source_url):
         print(f"[trigger] {symbol} ({mint}) rejeté — MC=${market_cap:,.0f} price_change_m5={price_change_m5} tx_accel={tx_accel}")
         return False
 
-    rug_ok, rug_score, rug_flags, top10_pct, insiders_detected, lp_locked_pct, total_holders, bundle_detected = rugcheck_verdict(mint)
-    if not rug_ok:
-        print(f"[rugcheck] {symbol} ({mint}) rejeté — score={rug_score} flags={rug_flags} top10={top10_pct}")
-        return False
-
+    # --- FILTRE D'ÂGE DU POOL (avant tout le reste, pour ne pas gaspiller
+    # d'appels API RugCheck sur de vieux tokens) ---
+    # Les signaux entrent à 30s ou 3 min APRÈS le début du suivi : ce suivi
+    # doit donc démarrer très tôt après la migration, sinon les alertes
+    # arrivent sur des tokens déjà anciens (vu en pratique : un pool de 29h
+    # avait quand même déclenché une alerte).
     pair_created_at = pair.get("pairCreatedAt")
     pool_age_seconds = None
     if pair_created_at:
@@ -993,6 +2013,22 @@ def essayer_alerter(mint, pair, source_url):
             pool_age_seconds = round(time.time() - (float(pair_created_at) / 1000))
         except (TypeError, ValueError):
             pool_age_seconds = None
+
+    if POOL_AGE_STRICT_FILTER:
+        if pool_age_seconds is None:
+            print(f"[pool_age] {symbol} ({mint}) rejeté — âge du pool inconnu")
+            return False
+        if pool_age_seconds > POOL_AGE_IDEAL_MAX_SECONDS:
+            print(
+                f"[pool_age] {symbol} ({mint}) rejeté — pool_age={pool_age_seconds}s "
+                f"(> {POOL_AGE_IDEAL_MAX_SECONDS}s), trop vieux pour un signal early-entry"
+            )
+            return False
+
+    rug_ok, rug_score, rug_flags, top10_pct, insiders_detected, lp_locked_pct, total_holders, bundle_detected = rugcheck_verdict(mint)
+    if not rug_ok:
+        print(f"[rugcheck] {symbol} ({mint}) rejeté — score={rug_score} flags={rug_flags} top10={top10_pct}")
+        return False
 
     boost_detecte, nombre_boosts_actifs = extraire_infos_boost(pair)
     a_un_profil, site_web, twitter, telegram_link = extraire_infos_profil(pair)
@@ -1023,26 +2059,12 @@ def essayer_alerter(mint, pair, source_url):
     bundle_txt = "⚠️ Oui" if bundle_detected else "Non"
     boost_txt = f"⚡ Oui ({nombre_boosts_actifs})" if boost_detecte else "Non"
     profil_txt = "✅ Oui" if a_un_profil else "Non"
-    msg_ok = (
-        f"✅ *Nouveau Token Solana Détecté !*\n\n"
-        f"🪙 Nom : {name} ({symbol})\n"
-        f"🏦 DEX : {dex_name}\n"
-        f"📊 Market Cap / FDV : ${market_cap:,.0f}\n"
-        f"💧 Liquidité USD : ${liquidity_usd:,.0f}\n"
-        f"🛡️ RugCheck Score : {rug_score}/100\n"
-        f"🚩 Flags : {flags_txt}\n"
-        f"👥 Top 10 holders : {top10_txt}\n"
-        f"👤 Nombre de holders : {holders_txt}\n"
-        f"📦 Bundle détecté : {bundle_txt}\n"
-        f"🕵️ Insiders détectés : {insiders_detected}\n"
-        f"🚀 Boosté DexScreener : {boost_txt}\n"
-        f"🌐 Profil DexScreener : {profil_txt}\n"
-        f"🔗 [Voir sur DexScreener]({pair_url_link})\n"
-        f"⚡ [Trader sur Axiom](https://axiom.trade/meme/{mint})\n"
-        f"🔍 [Voir sur RugCheck](https://rugcheck.xyz/tokens/{mint})"
-    )
-    send_telegram_message(msg_ok)
-    print(f"Alerte envoyée pour : {symbol} ({mint}) — RugCheck score={rug_score} top10={top10_pct}%")
+    # Note : aucune alerte Telegram n'est envoyée ici. Le token passe en
+    # suivi silencieux ; les SEULES alertes envoyées sur Telegram sont
+    # celles des 4 signaux (voir evaluer_signal3_si_pret /
+    # evaluer_signal_lp_light_si_pret / evaluer_signaux_1_et_2),
+    # chacune uniquement si son propre critère est validé.
+    print(f"Suivi démarré (silencieux) pour : {symbol} ({mint}) — RugCheck score={rug_score} top10={top10_pct}%")
 
     active_tokens[mint] = {
         "symbol": symbol,
@@ -1103,6 +2125,11 @@ def essayer_alerter(mint, pair, source_url):
         "mult_30s": None,
         "mult_1m": None,
         "max_tx_per_second": None,
+        # --- État des signaux ---
+        "signal3_evalue": False,
+        "signal_lp_light_evalue": False,
+        "signaux_1_2_evalues": False,
+        "positions": {},  # cle_signal ("signal1"/"signal2"/"signal3"/"signal_lp_light") -> dict de position simulée
     }
     seen_mints.add(mint)
 
@@ -1126,7 +2153,7 @@ def check_new_solana_tokens():
         print(f"[debug] {len(profiles)} profils reçus")
 
         for profile in profiles:
-            if not profile or profile.get("chainId") != "solana":
+            if not profile or profile.get("chainId") != CHAIN_ID_SOLANA:
                 continue
 
             mint = profile.get("tokenAddress")
@@ -1151,14 +2178,6 @@ def check_new_solana_tokens():
 # ============================================================
 # --- TOKENS BOOSTÉS DEXSCREENER (quel que soit leur âge) ---
 # ============================================================
-# Contrairement à /token-profiles/latest/v1 (derniers PROFILS remplis,
-# indépendant des boosts), ces deux endpoints listent les tokens BOOSTÉS :
-#   - /token-boosts/latest/v1 : les boosts les plus récents
-#   - /token-boosts/top/v1    : les tokens avec le plus de boosts actifs
-#     en ce moment (inclut des tokens boostés il y a plus longtemps, tant
-#     que leur boost est toujours actif -> c'est ce qui permet de capter
-#     "quel que soit leur âge", indépendamment du flux "latest").
-# On combine les deux pour maximiser la couverture, dédoublonné par mint.
 BOOSTED_ENDPOINTS = (
     "https://api.dexscreener.com/token-boosts/latest/v1",
     "https://api.dexscreener.com/token-boosts/top/v1",
@@ -1180,7 +2199,7 @@ def check_boosted_tokens():
             print(f"[debug_boosts] {len(boosts)} tokens boostés reçus depuis {url}")
 
             for boost in boosts:
-                if not boost or boost.get("chainId") != "solana":
+                if not boost or boost.get("chainId") != CHAIN_ID_SOLANA:
                     continue
 
                 mint = boost.get("tokenAddress")
@@ -1188,9 +2207,6 @@ def check_boosted_tokens():
                     continue
                 mints_vus_ce_cycle.add(mint)
 
-                # Même logique de dédoublonnage que pour les profils : on
-                # ignore ce qui est déjà alerté, déjà en attente de
-                # migration, ou déjà en cours de suivi ATH.
                 if mint in seen_mints or mint in pending_mints or mint in active_tokens:
                     continue
 
@@ -1198,10 +2214,6 @@ def check_boosted_tokens():
                 source_url = boost.get("url", f"https://dexscreener.com/solana/{mint}")
 
                 if not pair or pair.get("dexId") not in DEX_MIGRES:
-                    # Pas encore migré -> on le place en attente comme pour
-                    # les profils : check_pending_tokens() le retentera
-                    # ensuite jusqu'à PENDING_MAX_AGE (24h), quel que soit
-                    # son âge au moment où on l'a repéré comme boosté.
                     pending_mints[mint] = time.time()
                     continue
 
@@ -1259,41 +2271,36 @@ def monitor_ath():
 
         if do_price_check:
             try:
-                url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
-                res = requests.get(url, timeout=5)
-                if res.status_code == 200:
-                    token_data = res.json()
-                    pairs = token_data.get("pairs") if token_data else None
-                    if pairs and pairs[0]:
-                        current_mc = pairs[0].get("marketCap", 0) or pairs[0].get("fdv", 0)
-                        print(f"[monitor_ath] {data['symbol']} ({mint}) MC actuel=${current_mc:,.0f} (max enregistré=${data['max_price']:,.0f})")
-                        if current_mc and current_mc > data["max_price"]:
-                            active_tokens[mint]["max_price"] = current_mc
-                            active_tokens[mint]["max_price_time"] = round(elapsed)
-                        if current_mc and current_mc < active_tokens[mint].get("min_price", current_mc):
-                            active_tokens[mint]["min_price"] = current_mc
-                            active_tokens[mint]["min_price_time"] = round(elapsed)
+                pair0 = fetch_pair_data(mint)
+                if pair0:
+                    current_mc = pair0.get("marketCap", 0) or pair0.get("fdv", 0)
+                    print(f"[monitor_ath] {data['symbol']} ({mint}) MC actuel=${current_mc:,.0f} (max enregistré=${data['max_price']:,.0f})")
+                    if current_mc and current_mc > data["max_price"]:
+                        active_tokens[mint]["max_price"] = current_mc
+                        active_tokens[mint]["max_price_time"] = round(elapsed)
+                    if current_mc and current_mc < active_tokens[mint].get("min_price", current_mc):
+                        active_tokens[mint]["min_price"] = current_mc
+                        active_tokens[mint]["min_price_time"] = round(elapsed)
 
-                        boost_detecte_maj, nb_boosts_maj = extraire_infos_boost(pairs[0])
-                        if boost_detecte_maj:
-                            active_tokens[mint]["boost_detecte"] = True
-                            active_tokens[mint]["nombre_boosts_actifs"] = max(
-                                nb_boosts_maj, active_tokens[mint].get("nombre_boosts_actifs", 0) or 0
-                            )
+                    boost_detecte_maj, nb_boosts_maj = extraire_infos_boost(pair0)
+                    if boost_detecte_maj:
+                        active_tokens[mint]["boost_detecte"] = True
+                        active_tokens[mint]["nombre_boosts_actifs"] = max(
+                            nb_boosts_maj, active_tokens[mint].get("nombre_boosts_actifs", 0) or 0
+                        )
 
-                        profil_detecte_maj, site_maj, twitter_maj, telegram_maj = extraire_infos_profil(pairs[0])
-                        if profil_detecte_maj:
-                            active_tokens[mint]["profil_dexscreener"] = True
-                            active_tokens[mint]["site_web"] = active_tokens[mint].get("site_web") or site_maj
-                            active_tokens[mint]["twitter"] = active_tokens[mint].get("twitter") or twitter_maj
-                            active_tokens[mint]["telegram"] = active_tokens[mint].get("telegram") or telegram_maj
+                    profil_detecte_maj, site_maj, twitter_maj, telegram_maj = extraire_infos_profil(pair0)
+                    if profil_detecte_maj:
+                        active_tokens[mint]["profil_dexscreener"] = True
+                        active_tokens[mint]["site_web"] = active_tokens[mint].get("site_web") or site_maj
+                        active_tokens[mint]["twitter"] = active_tokens[mint].get("twitter") or twitter_maj
+                        active_tokens[mint]["telegram"] = active_tokens[mint].get("telegram") or telegram_maj
 
-                        if current_mc:
-                            gerer_simulation_position(mint, current_mc, elapsed)
-                    else:
-                        print(f"[monitor_ath] {data['symbol']} ({mint}) aucune pair retournée par DexScreener")
+                    if current_mc:
+                        gerer_simulation_position(mint, current_mc, elapsed)
+                        gerer_positions_signaux(mint, current_mc)
                 else:
-                    print(f"[monitor_ath] {data['symbol']} ({mint}) status={res.status_code} — {res.text[:200]}")
+                    print(f"[monitor_ath] {data['symbol']} ({mint}) aucune pair Solana retournée par DexScreener")
             except Exception as e:
                 print(f"Erreur monitor_ath pour {mint} : {e}")
 
@@ -1319,43 +2326,68 @@ def monitor_ath():
                 except (TypeError, ValueError):
                     pass
 
+            # --- Clôture des positions simulées des signaux (si encore
+            # ouvertes à 30min, on les considère expirées au meilleur MC
+            # observé depuis leur entrée, comme pour resultat_pct_simule) ---
+            cloturer_positions_signaux_expirees(mint, max_mc)
+
             multiplicateur = max_mc / initial_mc
             dex_url = data.get("dex_url", f"https://dexscreener.com/solana/{mint}")
-
-            boost_txt_rapport = (
-                f"Oui ({data.get('nombre_boosts_actifs', 0)})"
-                if data.get("boost_detecte") else "Non"
-            )
 
             if data.get("signal_valide") and data.get("resultat_pct_simule") is None:
                 entree = data.get("prix_entree_simule") or initial_mc
                 active_tokens[mint]["resultat_pct_simule"] = round((max_mc / entree - 1) * 100, 2)
                 if data.get("position_statut") in ("ouverte", "tp1", "trailing"):
                     active_tokens[mint]["position_statut"] = "expire_30min"
-                data = active_tokens[mint]
+            data = active_tokens[mint]
 
-            if data.get("signal_valide"):
-                resultat_txt = (
-                    f"{data.get('resultat_pct_simule', 0):+.1f}%"
-                    if data.get("resultat_pct_simule") is not None else "N/A"
+            # --- Rapport 30 min : envoyé UNIQUEMENT si au moins un des 4
+            # signaux (signal1/signal2/signal3/signal_lp_light) a été
+            # validé sur ce token (donc au moins une position simulée
+            # ouverte dans data["positions"]). Les tokens suivis
+            # silencieusement sans aucun signal déclenché ne génèrent
+            # plus aucune alerte. ---
+            positions_declenchees = data.get("positions") or {}
+            if positions_declenchees:
+                boost_txt_rapport = (
+                    f"Oui ({data.get('nombre_boosts_actifs', 0)})"
+                    if data.get("boost_detecte") else "Non"
                 )
-                simulation_txt = f"🎯 Signal validé — Résultat simulé : {resultat_txt} (statut: {data.get('position_statut')})\n"
-            else:
-                simulation_txt = "🎯 Signal non validé par les triggers (pas de simulation)\n"
 
-            msg_rapport = (
-                f"📋 *Rapport 30 min*\n\n"
-                f"🪙 Token : {data['symbol']}\n"
-                f"💰 Market Cap initial (à la migration) : ${initial_mc:,.0f}\n"
-                f"🏆 Market Cap max atteint : ${max_mc:,.0f}\n"
-                f"✖️ Multiplicateur : x{multiplicateur:,.2f}\n"
-                f"🚀 Boosté : {boost_txt_rapport}\n"
-                f"{simulation_txt}"
-                f"🔗 [Voir sur DexScreener]({dex_url})\n"
-                f"⚡ [Trader sur Axiom](https://axiom.trade/meme/{mint})"
-            )
-            send_telegram_message(msg_rapport)
-            print(f"Rapport 30 min envoyé pour : {data['symbol']} — x{multiplicateur:,.2f}")
+                lignes_signaux = []
+                for cle_pos, pos in positions_declenchees.items():
+                    trailing = pos.get("trailing", {})
+                    t25 = trailing.get("trail25", {})
+                    t30 = trailing.get("trail30", {})
+                    t40 = trailing.get("trail40", {})
+
+                    def _fmt(tv):
+                        pct = tv.get("resultat_pct")
+                        return f"{pct:+.1f}%" if pct is not None else "N/A"
+
+                    lignes_signaux.append(
+                        f"🎯 *{pos.get('nom')}* (entrée à {pos.get('entry_elapsed_s')}s, "
+                        f"MC ${pos.get('entry_price', 0):,.0f})\n"
+                        f"   ↳ Trailing 25% : {_fmt(t25)} ({t25.get('statut')}) | "
+                        f"30% : {_fmt(t30)} ({t30.get('statut')}) | "
+                        f"40% : {_fmt(t40)} ({t40.get('statut')})"
+                    )
+
+                msg_rapport = (
+                    f"📋 *Rapport 30 min — signal(aux) validé(s)*\n\n"
+                    f"🪙 Token : {_echapper_markdown(data['symbol'])}\n"
+                    f"💰 Market Cap initial (à la migration) : ${initial_mc:,.0f}\n"
+                    f"🏆 Market Cap max atteint : ${max_mc:,.0f}\n"
+                    f"✖️ Multiplicateur : x{multiplicateur:,.2f}\n"
+                    f"🚀 Boosté : {boost_txt_rapport}\n\n"
+                    + "\n\n".join(lignes_signaux) +
+                    f"\n\n🔗 [Voir sur DexScreener]({dex_url})\n"
+                    f"⚡ [Trader sur Axiom](https://axiom.trade/meme/{mint})"
+                )
+                send_telegram_message(msg_rapport)
+                print(f"[monitor_ath] Rapport 30 min envoyé (signal validé) pour : {data['symbol']} — x{multiplicateur:,.2f}")
+            else:
+                print(f"[monitor_ath] Suivi 30 min terminé pour : {data['symbol']} — x{multiplicateur:,.2f} (aucun signal validé, pas d'alerte)")
 
             entry_stats = data.get("entry_stats", {})
 
@@ -1369,6 +2401,7 @@ def monitor_ath():
             ratio_liquidite_mc = round(_safe_div(liquidite_usd, initial_mc), 4)
 
             simulations_sortie = simuler_strategies_sortie(ohlcv_list, data.get("initial_price"))
+            simulations_avancees = simuler_strategies_avancees(ohlcv_list, data.get("initial_price"), data["start_time"])
 
             time_to_max_drawdown, minutes_ecoulees_dd = calculer_timing_drawdown(
                 ohlcv_list, data.get("initial_price"), data["start_time"],
@@ -1380,7 +2413,7 @@ def monitor_ath():
             elif max_drawdown_before_peak == 0:
                 vitesse_chute_pct_par_min = 0.0
 
-            log_resultat_csv({
+            row_rapport = {
                 "horodatage": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "mint": mint,
                 "symbole": data["symbol"],
@@ -1452,7 +2485,17 @@ def monitor_ath():
                 "time_to_max_drawdown": time_to_max_drawdown,
                 "vitesse_chute_pct_par_min": vitesse_chute_pct_par_min,
                 **simulations_sortie,
-            })
+                **simulations_avancees,
+            }
+            log_resultat_csv(row_rapport)
+
+            # --- Nouveau tableau CSV : uniquement les signaux déclenchés
+            # (1 ligne par signal validé sur ce token), avec les résultats
+            # des 3 trailing stops comparés (-25% / -30% / -40%). Une
+            # version enrichie (avant__*/apres__*) est écrite en parallèle
+            # dans signaux_log_enrichi.csv, sans jamais toucher à
+            # signaux_log.csv. ---
+            log_resultats_signaux(mint, data, max_mc, row_rapport)
 
             tokens_to_remove.append(mint)
 
@@ -1486,11 +2529,24 @@ dextools_seen_posts = set()
 _dextools_last_channel_check = 0
 _dextools_last_price_check = 0
 
-SOLANA_ADDRESS_RE = re.compile(r'\b[1-9A-HJ-NP-Za-km-z]{32,44}\b')
-
+# --- Extraction du mint : UNIQUEMENT via des liens explicitement Solana ---
+# Le canal @DexToolsPublic publie des tokens multi-chaînes (ETH, BSC, Base,
+# Solana, etc.). Pour ne jamais capter un token d'une autre chaîne, on
+# n'extrait un mint QUE s'il apparaît dans un lien qui pointe explicitement
+# vers un explorateur/aggrégateur Solana. On abandonne le fallback "adresse
+# base58 générique" qui pouvait matcher n'importe quel texte du post.
 CA_FROM_LINK_RE = re.compile(
     r'(?:dexscreener\.com/solana/|solscan\.io/token/|birdeye\.so/token/|pump\.fun/(?:coin/)?)'
     r'([1-9A-HJ-NP-Za-km-z]{32,44})'
+)
+
+# Marqueurs texte qui indiquent que le post concerne une AUTRE chaîne que
+# Solana (ETH/BSC/Base/Polygon/Arbitrum/etc.) : si l'un d'eux apparaît dans
+# le message et qu'aucun lien Solana explicite n'a été trouvé, on rejette.
+AUTRES_CHAINES_KEYWORDS_RE = re.compile(
+    r'\b(ethereum|erc-?20|etherscan\.io|bscscan\.com|binance smart chain|bnb chain|'
+    r'polygonscan\.com|arbiscan\.io|basescan\.org|uniswap|pancakeswap)\b',
+    re.IGNORECASE,
 )
 
 POST_BLOCK_RE = re.compile(
@@ -1522,7 +2578,7 @@ def fetch_dextools_channel_html():
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         }
         res = requests.get(DEXTOOLS_CHANNEL_URL, headers=headers, timeout=15)
         if res.status_code != 200:
@@ -1535,11 +2591,15 @@ def fetch_dextools_channel_html():
 
 
 def extraire_mint_dextools(message_html, message_txt):
+    """Retourne un mint UNIQUEMENT s'il provient d'un lien explicitement
+    Solana. Retourne None si le post référence une autre chaîne, ou si
+    aucun lien Solana explicite n'est trouvé (plus de fallback générique)."""
+    if AUTRES_CHAINES_KEYWORDS_RE.search(message_txt):
+        return None
     m = CA_FROM_LINK_RE.search(message_html)
     if m:
         return m.group(1)
-    candidats = SOLANA_ADDRESS_RE.findall(message_txt)
-    return candidats[0] if candidats else None
+    return None
 
 
 def extraire_infos_alerte_dextools(message_html):
@@ -1600,7 +2660,7 @@ def check_dextools_channel():
 
         mint = extraire_mint_dextools(bloc, message_txt)
         if not mint:
-            print(f"[dextools] post {post_id} — aucune adresse token trouvée, ignoré")
+            print(f"[dextools] post {post_id} — pas de lien Solana explicite (autre chaîne ou non identifiable), ignoré")
             continue
 
         if mint in dextools_tracked:
@@ -1629,19 +2689,23 @@ def check_dextools_channel_throttled():
 
 
 def demarrer_suivi_dextools(mint, infos_alerte, post_id, alert_time, alert_dt):
+    # Confirmation finale via DexScreener : fetch_pair_data() ne renvoie
+    # désormais QUE des paires chainId == "solana" (cf. plus haut). Si
+    # aucune pair Solana n'est trouvée pour ce mint, on abandonne le
+    # suivi plutôt que de tracker un token à l'aveugle.
     pair = fetch_pair_data(mint)
-    mc_initial, prix_initial, liquidite_usd, pool_address = None, None, None, None
-    if pair:
-        mc_initial = pair.get("marketCap", 0) or pair.get("fdv", 0) or None
-        prix_initial = _to_float(pair.get("priceUsd"))
-        liquidite_usd = (pair.get("liquidity") or {}).get("usd")
-        pool_address = pair.get("pairAddress")
+    if not pair:
+        print(f"[dextools] {mint} — aucune pair Solana confirmée via DexScreener, suivi ignoré")
+        return
+
+    mc_initial = pair.get("marketCap", 0) or pair.get("fdv", 0) or None
+    prix_initial = _to_float(pair.get("priceUsd"))
+    liquidite_usd = (pair.get("liquidity") or {}).get("usd")
+    pool_address = pair.get("pairAddress")
 
     _rug_ok, score_rugcheck, flags_rugcheck, top10_pct, insiders_detected, lp_locked_pct, total_holders, bundle_detected = rugcheck_verdict(mint)
 
-    a_un_profil, site_web, twitter, telegram_link = (False, None, None, None)
-    if pair:
-        a_un_profil, site_web, twitter, telegram_link = extraire_infos_profil(pair)
+    a_un_profil, site_web, twitter, telegram_link = extraire_infos_profil(pair)
 
     dextools_tracked[mint] = {
         "post_id": post_id,
@@ -1676,7 +2740,7 @@ def demarrer_suivi_dextools(mint, infos_alerte, post_id, alert_time, alert_dt):
         "lien_dexscreener": f"https://dexscreener.com/solana/{mint}",
     }
 
-    print(f"[dextools] nouveau suivi démarré pour {mint} (post {post_id}, MC initial={mc_initial})")
+    print(f"[dextools] nouveau suivi démarré pour {mint} (post {post_id}, MC initial={mc_initial}) — confirmé Solana")
 
 
 def get_ath_24h_via_gecko(pool_address):
