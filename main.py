@@ -4,6 +4,7 @@ import csv
 import html
 import time
 import threading
+import traceback
 import requests
 from datetime import datetime
 
@@ -2270,236 +2271,274 @@ def monitor_ath():
         _last_price_check = current_time
 
     for mint, data in list(active_tokens.items()):
-        elapsed = current_time - data["start_time"]
+        # --- CORRECTIF : tout le traitement par token est maintenant
+        # protégé par un try/except. Avant ce correctif, une exception
+        # levée pendant la finalisation d'UN SEUL token (calcul, division,
+        # f-string sur une valeur inattendue, etc.) faisait planter tout
+        # le process Python. Sur Railway, cela provoque un redémarrage du
+        # service : active_tokens (en mémoire, jamais persisté) repart à
+        # zéro, et TOUS les tokens en cours de suivi à ce moment-là
+        # perdent leur suivi ET leur rapport 30 min, sans qu'aucune trace
+        # ne soit visible ailleurs que dans les logs Railway. Avec ce
+        # correctif, une erreur sur un token est loguée et ce token est
+        # simplement retiré du suivi, sans affecter les autres tokens ni
+        # la boucle principale du bot. ---
+        try:
+            elapsed = current_time - data["start_time"]
 
-        if do_price_check:
-            try:
-                pair0 = fetch_pair_data(mint)
-                if pair0:
-                    current_mc = pair0.get("marketCap", 0) or pair0.get("fdv", 0)
-                    print(f"[monitor_ath] {data['symbol']} ({mint}) MC actuel=${current_mc:,.0f} (max enregistré=${data['max_price']:,.0f})")
-                    if current_mc and current_mc > data["max_price"]:
-                        active_tokens[mint]["max_price"] = current_mc
-                        active_tokens[mint]["max_price_time"] = round(elapsed)
-                    if current_mc and current_mc < active_tokens[mint].get("min_price", current_mc):
-                        active_tokens[mint]["min_price"] = current_mc
-                        active_tokens[mint]["min_price_time"] = round(elapsed)
-
-                    boost_detecte_maj, nb_boosts_maj = extraire_infos_boost(pair0)
-                    if boost_detecte_maj:
-                        active_tokens[mint]["boost_detecte"] = True
-                        active_tokens[mint]["nombre_boosts_actifs"] = max(
-                            nb_boosts_maj, active_tokens[mint].get("nombre_boosts_actifs", 0) or 0
-                        )
-
-                    profil_detecte_maj, site_maj, twitter_maj, telegram_maj = extraire_infos_profil(pair0)
-                    if profil_detecte_maj:
-                        active_tokens[mint]["profil_dexscreener"] = True
-                        active_tokens[mint]["site_web"] = active_tokens[mint].get("site_web") or site_maj
-                        active_tokens[mint]["twitter"] = active_tokens[mint].get("twitter") or twitter_maj
-                        active_tokens[mint]["telegram"] = active_tokens[mint].get("telegram") or telegram_maj
-
-                    if current_mc:
-                        gerer_simulation_position(mint, current_mc, elapsed)
-                        gerer_positions_signaux(mint, current_mc)
-                else:
-                    print(f"[monitor_ath] {data['symbol']} ({mint}) aucune pair Solana retournée par DexScreener")
-            except Exception as e:
-                print(f"Erreur monitor_ath pour {mint} : {e}")
-
-        if elapsed >= 1800:
-            initial_mc = data["initial_mc"] or 1.0
-            pool_address = data.get("pool_address")
-
-            elapsed_minutes = max(int(elapsed / 60) + 5, 10)
-            ohlcv_list = fetch_ohlcv_minute(pool_address, elapsed_minutes)
-
-            true_ath_mc = get_true_ath_mc(
-                pool_address, initial_mc, data.get("initial_price"), data["start_time"], ohlcv_list=ohlcv_list,
-            )
-            print(f"[monitor_ath] {data['symbol']} ({mint}) GeckoTerminal ATH mc={true_ath_mc}")
-            max_mc = max(active_tokens[mint]["max_price"], true_ath_mc or 0)
-
-            temps_pic = active_tokens[mint].get("max_price_time", 0)
-            if ohlcv_list and true_ath_mc and true_ath_mc >= active_tokens[mint]["max_price"]:
+            if do_price_check:
                 try:
-                    meilleure_bougie = max((c for c in ohlcv_list if len(c) >= 3), key=lambda c: c[2], default=None)
-                    if meilleure_bougie:
-                        temps_pic = max(round(meilleure_bougie[0] - data["start_time"]), 0)
-                except (TypeError, ValueError):
-                    pass
+                    pair0 = fetch_pair_data(mint)
+                    if pair0:
+                        current_mc = pair0.get("marketCap", 0) or pair0.get("fdv", 0)
+                        print(f"[monitor_ath] {data['symbol']} ({mint}) MC actuel=${current_mc:,.0f} (max enregistré=${data['max_price']:,.0f})")
+                        if current_mc and current_mc > data["max_price"]:
+                            active_tokens[mint]["max_price"] = current_mc
+                            active_tokens[mint]["max_price_time"] = round(elapsed)
+                        if current_mc and current_mc < active_tokens[mint].get("min_price", current_mc):
+                            active_tokens[mint]["min_price"] = current_mc
+                            active_tokens[mint]["min_price_time"] = round(elapsed)
 
-            # --- Clôture des positions simulées des signaux (si encore
-            # ouvertes à 30min, on les considère expirées au meilleur MC
-            # observé depuis leur entrée, comme pour resultat_pct_simule) ---
-            cloturer_positions_signaux_expirees(mint, max_mc)
+                        boost_detecte_maj, nb_boosts_maj = extraire_infos_boost(pair0)
+                        if boost_detecte_maj:
+                            active_tokens[mint]["boost_detecte"] = True
+                            active_tokens[mint]["nombre_boosts_actifs"] = max(
+                                nb_boosts_maj, active_tokens[mint].get("nombre_boosts_actifs", 0) or 0
+                            )
 
-            multiplicateur = max_mc / initial_mc
-            dex_url = data.get("dex_url", f"https://dexscreener.com/solana/{mint}")
+                        profil_detecte_maj, site_maj, twitter_maj, telegram_maj = extraire_infos_profil(pair0)
+                        if profil_detecte_maj:
+                            active_tokens[mint]["profil_dexscreener"] = True
+                            active_tokens[mint]["site_web"] = active_tokens[mint].get("site_web") or site_maj
+                            active_tokens[mint]["twitter"] = active_tokens[mint].get("twitter") or twitter_maj
+                            active_tokens[mint]["telegram"] = active_tokens[mint].get("telegram") or telegram_maj
 
-            if data.get("signal_valide") and data.get("resultat_pct_simule") is None:
-                entree = data.get("prix_entree_simule") or initial_mc
-                active_tokens[mint]["resultat_pct_simule"] = round((max_mc / entree - 1) * 100, 2)
-                if data.get("position_statut") in ("ouverte", "tp1", "trailing"):
-                    active_tokens[mint]["position_statut"] = "expire_30min"
-            data = active_tokens[mint]
+                        if current_mc:
+                            gerer_simulation_position(mint, current_mc, elapsed)
+                            gerer_positions_signaux(mint, current_mc)
+                    else:
+                        print(f"[monitor_ath] {data['symbol']} ({mint}) aucune pair Solana retournée par DexScreener")
+                except Exception as e:
+                    print(f"Erreur monitor_ath (price_check) pour {mint} : {e}")
 
-            # --- Rapport 30 min : envoyé UNIQUEMENT si au moins un des 4
-            # signaux (signal1/signal2/signal3/signal_lp_light) a été
-            # validé sur ce token (donc au moins une position simulée
-            # ouverte dans data["positions"]). Les tokens suivis
-            # silencieusement sans aucun signal déclenché ne génèrent
-            # plus aucune alerte. ---
-            positions_declenchees = data.get("positions") or {}
-            if positions_declenchees:
-                boost_txt_rapport = (
-                    f"Oui ({data.get('nombre_boosts_actifs', 0)})"
-                    if data.get("boost_detecte") else "Non"
+            if elapsed >= 1800:
+                initial_mc = data["initial_mc"] or 1.0
+                pool_address = data.get("pool_address")
+
+                elapsed_minutes = max(int(elapsed / 60) + 5, 10)
+                ohlcv_list = fetch_ohlcv_minute(pool_address, elapsed_minutes)
+
+                true_ath_mc = get_true_ath_mc(
+                    pool_address, initial_mc, data.get("initial_price"), data["start_time"], ohlcv_list=ohlcv_list,
                 )
+                print(f"[monitor_ath] {data['symbol']} ({mint}) GeckoTerminal ATH mc={true_ath_mc}")
+                max_mc = max(active_tokens[mint]["max_price"], true_ath_mc or 0)
 
-                lignes_signaux = []
-                for cle_pos, pos in positions_declenchees.items():
-                    trailing = pos.get("trailing", {})
-                    t25 = trailing.get("trail25", {})
-                    t30 = trailing.get("trail30", {})
-                    t40 = trailing.get("trail40", {})
+                temps_pic = active_tokens[mint].get("max_price_time", 0)
+                if ohlcv_list and true_ath_mc and true_ath_mc >= active_tokens[mint]["max_price"]:
+                    try:
+                        meilleure_bougie = max((c for c in ohlcv_list if len(c) >= 3), key=lambda c: c[2], default=None)
+                        if meilleure_bougie:
+                            temps_pic = max(round(meilleure_bougie[0] - data["start_time"]), 0)
+                    except (TypeError, ValueError):
+                        pass
 
-                    def _fmt(tv):
-                        pct = tv.get("resultat_pct")
-                        return f"{pct:+.1f}%" if pct is not None else "N/A"
+                # --- Clôture des positions simulées des signaux (si encore
+                # ouvertes à 30min, on les considère expirées au meilleur MC
+                # observé depuis leur entrée, comme pour resultat_pct_simule) ---
+                cloturer_positions_signaux_expirees(mint, max_mc)
 
-                    lignes_signaux.append(
-                        f"🎯 *{pos.get('nom')}* (entrée à {pos.get('entry_elapsed_s')}s, "
-                        f"MC ${pos.get('entry_price', 0):,.0f})\n"
-                        f"   ↳ Trailing 25% : {_fmt(t25)} ({t25.get('statut')}) | "
-                        f"30% : {_fmt(t30)} ({t30.get('statut')}) | "
-                        f"40% : {_fmt(t40)} ({t40.get('statut')})"
+                multiplicateur = max_mc / initial_mc
+                dex_url = data.get("dex_url", f"https://dexscreener.com/solana/{mint}")
+
+                if data.get("signal_valide") and data.get("resultat_pct_simule") is None:
+                    entree = data.get("prix_entree_simule") or initial_mc
+                    active_tokens[mint]["resultat_pct_simule"] = round((max_mc / entree - 1) * 100, 2)
+                    if data.get("position_statut") in ("ouverte", "tp1", "trailing"):
+                        active_tokens[mint]["position_statut"] = "expire_30min"
+                data = active_tokens[mint]
+
+                # --- Rapport 30 min : envoyé UNIQUEMENT si au moins un des 4
+                # signaux (signal1/signal2/signal3/signal_lp_light) a été
+                # validé sur ce token (donc au moins une position simulée
+                # ouverte dans data["positions"]). Les tokens suivis
+                # silencieusement sans aucun signal déclenché ne génèrent
+                # plus aucune alerte. ---
+                positions_declenchees = data.get("positions") or {}
+                if positions_declenchees:
+                    boost_txt_rapport = (
+                        f"Oui ({data.get('nombre_boosts_actifs', 0)})"
+                        if data.get("boost_detecte") else "Non"
                     )
 
-                msg_rapport = (
-                    f"📋 *Rapport 30 min — signal(aux) validé(s)*\n\n"
-                    f"🪙 Token : {_echapper_markdown(data['symbol'])}\n"
-                    f"💰 Market Cap initial (à la migration) : ${initial_mc:,.0f}\n"
-                    f"🏆 Market Cap max atteint : ${max_mc:,.0f}\n"
-                    f"✖️ Multiplicateur : x{multiplicateur:,.2f}\n"
-                    f"🚀 Boosté : {boost_txt_rapport}\n\n"
-                    + "\n\n".join(lignes_signaux) +
-                    f"\n\n🔗 [Voir sur DexScreener]({dex_url})\n"
-                    f"⚡ [Trader sur Axiom](https://axiom.trade/meme/{mint})"
+                    lignes_signaux = []
+                    for cle_pos, pos in positions_declenchees.items():
+                        trailing = pos.get("trailing", {})
+                        t25 = trailing.get("trail25", {})
+                        t30 = trailing.get("trail30", {})
+                        t40 = trailing.get("trail40", {})
+
+                        def _fmt(tv):
+                            pct = tv.get("resultat_pct")
+                            return f"{pct:+.1f}%" if pct is not None else "N/A"
+
+                        lignes_signaux.append(
+                            f"🎯 *{pos.get('nom')}* (entrée à {pos.get('entry_elapsed_s')}s, "
+                            f"MC ${pos.get('entry_price', 0):,.0f})\n"
+                            f"   ↳ Trailing 25% : {_fmt(t25)} ({t25.get('statut')}) | "
+                            f"30% : {_fmt(t30)} ({t30.get('statut')}) | "
+                            f"40% : {_fmt(t40)} ({t40.get('statut')})"
+                        )
+
+                    msg_rapport = (
+                        f"📋 *Rapport 30 min — signal(aux) validé(s)*\n\n"
+                        f"🪙 Token : {_echapper_markdown(data['symbol'])}\n"
+                        f"💰 Market Cap initial (à la migration) : ${initial_mc:,.0f}\n"
+                        f"🏆 Market Cap max atteint : ${max_mc:,.0f}\n"
+                        f"✖️ Multiplicateur : x{multiplicateur:,.2f}\n"
+                        f"🚀 Boosté : {boost_txt_rapport}\n\n"
+                        + "\n\n".join(lignes_signaux) +
+                        f"\n\n🔗 [Voir sur DexScreener]({dex_url})\n"
+                        f"⚡ [Trader sur Axiom](https://axiom.trade/meme/{mint})"
+                    )
+
+                    # --- CORRECTIF : Telegram refuse tout message texte de
+                    # plus de 4096 caractères. Sans troncature, un token
+                    # avec plusieurs signaux déclenchés en même temps
+                    # pouvait générer un message trop long : l'envoi
+                    # échouait alors silencieusement (l'erreur n'apparaît
+                    # que dans les logs Railway, jamais côté Telegram), et
+                    # le rapport 30 min n'arrivait jamais. ---
+                    LIMITE_TELEGRAM = 4000
+                    if len(msg_rapport) > LIMITE_TELEGRAM:
+                        msg_rapport = msg_rapport[:LIMITE_TELEGRAM] + "\n\n… (message tronqué, voir /csv_signaux pour le détail complet)"
+
+                    envoye_rapport = send_telegram_message(msg_rapport)
+                    if envoye_rapport:
+                        print(f"[monitor_ath] Rapport 30 min envoyé (signal validé) pour : {data['symbol']} — x{multiplicateur:,.2f}")
+                    else:
+                        print(f"[monitor_ath] !!! ÉCHEC ENVOI du rapport 30 min pour {data['symbol']} ({mint}), voir erreur juste au-dessus !!!")
+                else:
+                    print(f"[monitor_ath] Suivi 30 min terminé pour : {data['symbol']} — x{multiplicateur:,.2f} (aucun signal validé, pas d'alerte)")
+
+                entry_stats = data.get("entry_stats", {})
+
+                min_price = data.get("min_price", initial_mc)
+                max_drawdown_before_peak = round((min_price / initial_mc - 1) * 100, 2) if initial_mc else None
+
+                liquidite_usd = data.get("liquidity_usd")
+                pool_age_seconds = data.get("pool_age_seconds")
+                pool_age_minutes = round(pool_age_seconds / 60, 2) if pool_age_seconds is not None else None
+                is_golden_window = (pool_age_seconds is not None and pool_age_seconds <= GOLDEN_WINDOW_MAX_SECONDS)
+                ratio_liquidite_mc = round(_safe_div(liquidite_usd, initial_mc), 4)
+
+                simulations_sortie = simuler_strategies_sortie(ohlcv_list, data.get("initial_price"))
+                simulations_avancees = simuler_strategies_avancees(ohlcv_list, data.get("initial_price"), data["start_time"])
+
+                time_to_max_drawdown, minutes_ecoulees_dd = calculer_timing_drawdown(
+                    ohlcv_list, data.get("initial_price"), data["start_time"],
+                    min_price, data.get("min_price_time", 0),
                 )
-                send_telegram_message(msg_rapport)
-                print(f"[monitor_ath] Rapport 30 min envoyé (signal validé) pour : {data['symbol']} — x{multiplicateur:,.2f}")
-            else:
-                print(f"[monitor_ath] Suivi 30 min terminé pour : {data['symbol']} — x{multiplicateur:,.2f} (aucun signal validé, pas d'alerte)")
+                vitesse_chute_pct_par_min = None
+                if max_drawdown_before_peak is not None and minutes_ecoulees_dd and minutes_ecoulees_dd > 0:
+                    vitesse_chute_pct_par_min = round(max_drawdown_before_peak / minutes_ecoulees_dd, 2)
+                elif max_drawdown_before_peak == 0:
+                    vitesse_chute_pct_par_min = 0.0
 
-            entry_stats = data.get("entry_stats", {})
+                row_rapport = {
+                    "horodatage": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "mint": mint,
+                    "symbole": data["symbol"],
+                    "dex": data.get("dex"),
+                    "mc_initial": initial_mc,
+                    "mc_max": max_mc,
+                    "multiplicateur": round(multiplicateur, 3),
+                    "liquidite_usd": liquidite_usd,
+                    "ratio_liquidite": entry_stats.get("liquidity_ratio"),
+                    "score_rugcheck": data.get("rugcheck_score"),
+                    "alertes_rugcheck": data.get("rugcheck_flags"),
+                    "pct_top10_holders": data.get("top10_pct"),
+                    "insiders_detectes": data.get("insiders_detected"),
+                    "nombre_holders": data.get("total_holders"),
+                    "bundle_detecte": data.get("bundle_detected"),
+                    "pool_age_seconds": pool_age_seconds,
+                    "lp_locked_pct": data.get("lp_locked_pct"),
+                    "achats_m5": entry_stats.get("txns_buys_m5"),
+                    "ventes_m5": entry_stats.get("txns_sells_m5"),
+                    "volume_m5": entry_stats.get("volume_m5"),
+                    "achats_h1": entry_stats.get("txns_buys_h1"),
+                    "ventes_h1": entry_stats.get("txns_sells_h1"),
+                    "volume_h1": entry_stats.get("volume_h1"),
+                    "seconde_prix_plus_bas_20s": data.get("low_second_20s"),
+                    "multiplicateur_plus_bas_20s": data.get("low_mult_20s"),
+                    "buy_ratio_10s": data.get("buy_ratio_10s"),
+                    "buy_ratio_20s": data.get("buy_ratio_20s"),
+                    "achats_bruts_2s": data.get("achats_bruts_2s"),
+                    "price_change_m5": entry_stats.get("price_change_m5"),
+                    "tx_accel": entry_stats.get("tx_accel"),
+                    "buy_ratio_2s": data.get("buy_ratio_2s"),
+                    "boost_detecte": data.get("boost_detecte", False),
+                    "nombre_boosts_actifs": data.get("nombre_boosts_actifs", 0),
+                    "profil_dexscreener": data.get("profil_dexscreener", False),
+                    "site_web": data.get("site_web"),
+                    "twitter": data.get("twitter"),
+                    "telegram": data.get("telegram"),
+                    "tx_velocity_5s": data.get("tx_velocity_5s"),
+                    "buy_ratio_5s": data.get("buy_ratio_5s"),
+                    "avg_order_size_sol": entry_stats.get("avg_order_size_sol"),
+                    "unique_buyers_count": None,
+                    "buy_ratio_diag": data.get("buy_ratio_diag"),
+                    "signal_valide": data.get("signal_valide"),
+                    "buy_ratio_source": data.get("buy_ratio_source"),
+                    "position_statut": data.get("position_statut"),
+                    "resultat_pct_simule": data.get("resultat_pct_simule"),
+                    "time_to_2x": data.get("time_to_2x"),
+                    "time_to_3x": data.get("time_to_3x"),
+                    "max_drawdown_before_peak": max_drawdown_before_peak,
+                    "achats_10s": data.get("achats_10s"),
+                    "ventes_10s": data.get("ventes_10s"),
+                    "volume_m1": data.get("volume_m1"),
+                    "ratio_volume_m1_m5": data.get("ratio_volume_m1_m5"),
+                    "price_change_m1": data.get("price_change_m1"),
+                    "price_change_m3": data.get("price_change_m3"),
+                    "buy_ratio_1m": data.get("buy_ratio_1m"),
+                    "achats_m1": data.get("achats_m1"),
+                    "ratio_achats_m1_m5": data.get("ratio_achats_m1_m5"),
+                    "buy_tx_ratio_m5": data.get("buy_tx_ratio_m5"),
+                    "mult_10s": data.get("mult_10s"),
+                    "mult_30s": data.get("mult_30s"),
+                    "mult_1m": data.get("mult_1m"),
+                    "ratio_liquidite_mc": ratio_liquidite_mc,
+                    "sell_ratio_1m": data.get("sell_ratio_1m"),
+                    "max_tx_per_second": data.get("max_tx_per_second"),
+                    "pool_age_minutes": pool_age_minutes,
+                    "is_golden_window": is_golden_window,
+                    "time_to_peak": temps_pic,
+                    "time_to_max_drawdown": time_to_max_drawdown,
+                    "vitesse_chute_pct_par_min": vitesse_chute_pct_par_min,
+                    **simulations_sortie,
+                    **simulations_avancees,
+                }
+                log_resultat_csv(row_rapport)
 
-            min_price = data.get("min_price", initial_mc)
-            max_drawdown_before_peak = round((min_price / initial_mc - 1) * 100, 2) if initial_mc else None
+                # --- Nouveau tableau CSV : uniquement les signaux déclenchés
+                # (1 ligne par signal validé sur ce token), avec les résultats
+                # des 3 trailing stops comparés (-25% / -30% / -40%). Une
+                # version enrichie (avant__*/apres__*) est écrite en parallèle
+                # dans signaux_log_enrichi.csv, sans jamais toucher à
+                # signaux_log.csv. ---
+                log_resultats_signaux(mint, data, max_mc, row_rapport)
 
-            liquidite_usd = data.get("liquidity_usd")
-            pool_age_seconds = data.get("pool_age_seconds")
-            pool_age_minutes = round(pool_age_seconds / 60, 2) if pool_age_seconds is not None else None
-            is_golden_window = (pool_age_seconds is not None and pool_age_seconds <= GOLDEN_WINDOW_MAX_SECONDS)
-            ratio_liquidite_mc = round(_safe_div(liquidite_usd, initial_mc), 4)
+                tokens_to_remove.append(mint)
 
-            simulations_sortie = simuler_strategies_sortie(ohlcv_list, data.get("initial_price"))
-            simulations_avancees = simuler_strategies_avancees(ohlcv_list, data.get("initial_price"), data["start_time"])
-
-            time_to_max_drawdown, minutes_ecoulees_dd = calculer_timing_drawdown(
-                ohlcv_list, data.get("initial_price"), data["start_time"],
-                min_price, data.get("min_price_time", 0),
-            )
-            vitesse_chute_pct_par_min = None
-            if max_drawdown_before_peak is not None and minutes_ecoulees_dd and minutes_ecoulees_dd > 0:
-                vitesse_chute_pct_par_min = round(max_drawdown_before_peak / minutes_ecoulees_dd, 2)
-            elif max_drawdown_before_peak == 0:
-                vitesse_chute_pct_par_min = 0.0
-
-            row_rapport = {
-                "horodatage": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "mint": mint,
-                "symbole": data["symbol"],
-                "dex": data.get("dex"),
-                "mc_initial": initial_mc,
-                "mc_max": max_mc,
-                "multiplicateur": round(multiplicateur, 3),
-                "liquidite_usd": liquidite_usd,
-                "ratio_liquidite": entry_stats.get("liquidity_ratio"),
-                "score_rugcheck": data.get("rugcheck_score"),
-                "alertes_rugcheck": data.get("rugcheck_flags"),
-                "pct_top10_holders": data.get("top10_pct"),
-                "insiders_detectes": data.get("insiders_detected"),
-                "nombre_holders": data.get("total_holders"),
-                "bundle_detecte": data.get("bundle_detected"),
-                "pool_age_seconds": pool_age_seconds,
-                "lp_locked_pct": data.get("lp_locked_pct"),
-                "achats_m5": entry_stats.get("txns_buys_m5"),
-                "ventes_m5": entry_stats.get("txns_sells_m5"),
-                "volume_m5": entry_stats.get("volume_m5"),
-                "achats_h1": entry_stats.get("txns_buys_h1"),
-                "ventes_h1": entry_stats.get("txns_sells_h1"),
-                "volume_h1": entry_stats.get("volume_h1"),
-                "seconde_prix_plus_bas_20s": data.get("low_second_20s"),
-                "multiplicateur_plus_bas_20s": data.get("low_mult_20s"),
-                "buy_ratio_10s": data.get("buy_ratio_10s"),
-                "buy_ratio_20s": data.get("buy_ratio_20s"),
-                "achats_bruts_2s": data.get("achats_bruts_2s"),
-                "price_change_m5": entry_stats.get("price_change_m5"),
-                "tx_accel": entry_stats.get("tx_accel"),
-                "buy_ratio_2s": data.get("buy_ratio_2s"),
-                "boost_detecte": data.get("boost_detecte", False),
-                "nombre_boosts_actifs": data.get("nombre_boosts_actifs", 0),
-                "profil_dexscreener": data.get("profil_dexscreener", False),
-                "site_web": data.get("site_web"),
-                "twitter": data.get("twitter"),
-                "telegram": data.get("telegram"),
-                "tx_velocity_5s": data.get("tx_velocity_5s"),
-                "buy_ratio_5s": data.get("buy_ratio_5s"),
-                "avg_order_size_sol": entry_stats.get("avg_order_size_sol"),
-                "unique_buyers_count": None,
-                "buy_ratio_diag": data.get("buy_ratio_diag"),
-                "signal_valide": data.get("signal_valide"),
-                "buy_ratio_source": data.get("buy_ratio_source"),
-                "position_statut": data.get("position_statut"),
-                "resultat_pct_simule": data.get("resultat_pct_simule"),
-                "time_to_2x": data.get("time_to_2x"),
-                "time_to_3x": data.get("time_to_3x"),
-                "max_drawdown_before_peak": max_drawdown_before_peak,
-                "achats_10s": data.get("achats_10s"),
-                "ventes_10s": data.get("ventes_10s"),
-                "volume_m1": data.get("volume_m1"),
-                "ratio_volume_m1_m5": data.get("ratio_volume_m1_m5"),
-                "price_change_m1": data.get("price_change_m1"),
-                "price_change_m3": data.get("price_change_m3"),
-                "buy_ratio_1m": data.get("buy_ratio_1m"),
-                "achats_m1": data.get("achats_m1"),
-                "ratio_achats_m1_m5": data.get("ratio_achats_m1_m5"),
-                "buy_tx_ratio_m5": data.get("buy_tx_ratio_m5"),
-                "mult_10s": data.get("mult_10s"),
-                "mult_30s": data.get("mult_30s"),
-                "mult_1m": data.get("mult_1m"),
-                "ratio_liquidite_mc": ratio_liquidite_mc,
-                "sell_ratio_1m": data.get("sell_ratio_1m"),
-                "max_tx_per_second": data.get("max_tx_per_second"),
-                "pool_age_minutes": pool_age_minutes,
-                "is_golden_window": is_golden_window,
-                "time_to_peak": temps_pic,
-                "time_to_max_drawdown": time_to_max_drawdown,
-                "vitesse_chute_pct_par_min": vitesse_chute_pct_par_min,
-                **simulations_sortie,
-                **simulations_avancees,
-            }
-            log_resultat_csv(row_rapport)
-
-            # --- Nouveau tableau CSV : uniquement les signaux déclenchés
-            # (1 ligne par signal validé sur ce token), avec les résultats
-            # des 3 trailing stops comparés (-25% / -30% / -40%). Une
-            # version enrichie (avant__*/apres__*) est écrite en parallèle
-            # dans signaux_log_enrichi.csv, sans jamais toucher à
-            # signaux_log.csv. ---
-            log_resultats_signaux(mint, data, max_mc, row_rapport)
-
+        except Exception as e:
+            # Ne jamais laisser une erreur sur UN token faire planter tout
+            # le process (et donc perdre le suivi de TOUS les autres
+            # tokens en cours). On log en détail (avec la traceback) et on
+            # retire ce token du suivi pour ne pas boucler indéfiniment
+            # dessus.
+            print(f"[monitor_ath] ERREUR lors de la finalisation de {mint} : {e}")
+            traceback.print_exc()
             tokens_to_remove.append(mint)
 
     for mint in tokens_to_remove:
@@ -2885,11 +2924,21 @@ def check_boosted_tokens_throttled():
 if __name__ == "__main__":
     print("Bot de surveillance démarré...")
     while True:
-        check_telegram_commands()
-        check_new_solana_tokens()
-        check_boosted_tokens_throttled()
-        check_pending_tokens()
-        monitor_ath()
-        check_dextools_channel_throttled()
-        monitor_dextools_ath()
+        # --- CORRECTIF : la boucle principale est maintenant protégée par
+        # un try/except global. Avant, une exception non prévue dans
+        # n'importe laquelle des fonctions appelées ici faisait planter
+        # tout le process -> redémarrage Railway -> perte de active_tokens
+        # et de dextools_tracked (en mémoire uniquement), donc perte de
+        # suivi et de rapports 30 min pour tous les tokens en cours. ---
+        try:
+            check_telegram_commands()
+            check_new_solana_tokens()
+            check_boosted_tokens_throttled()
+            check_pending_tokens()
+            monitor_ath()
+            check_dextools_channel_throttled()
+            monitor_dextools_ath()
+        except Exception as e:
+            print(f"[boucle_principale] ERREUR non gérée : {e}")
+            traceback.print_exc()
         time.sleep(10)
