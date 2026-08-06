@@ -1367,6 +1367,16 @@ SIGNAL3_SEUIL = 95.6
 # déclencher même quand Signal 3 est rejeté par ses filtres.
 SIGNAL_LP_LIGHT_SEUIL = 95.6
 
+# Signal 4 — Momentum M3+M1 : entrée à 3 min, dès que price_change_m3 ET
+# price_change_m1 sont tous deux disponibles (calculés en fin de
+# analyser_metriques_etendues). Issu de l'analyse du dataset signaux_log :
+# c'est la combinaison qui, sur 97 signaux, fait passer le taux de
+# réussite (≥x2) de 22% (sans filtre) à 50%, et le multiplicateur moyen de
+# 1,84 à 2,75. Aucun filtre qualité additionnel (mc_initial, buy_ratio) :
+# signal indépendant, purement momentum, comme Signal LP light.
+SIGNAL4_PRICE_CHANGE_M3_MIN = 12
+SIGNAL4_PRICE_CHANGE_M1_MIN = 10
+
 # Anti-doublon : (mint, cle_signal) déjà écrit dans SIGNAUX_LOG_FILE
 signaux_traites = set()
 
@@ -1552,6 +1562,52 @@ def evaluer_signal_lp_light_si_pret(mint):
     ouvrir_position_signal(
         mint, "signal_lp_light", "Signal LP light (sans filtre)",
         "lp_locked_pct ÷ mult_30s", valeur, f"≤ {SIGNAL_LP_LIGHT_SEUIL}",
+        current_mc,
+    )
+
+
+def evaluer_signal4_si_pret(mint, mc_reference=None):
+    """Signal 4 — Momentum M3+M1 : price_change_m3 >= 12 ET
+    price_change_m1 >= 10, entrée à 3 min, SANS AUCUN filtre qualité
+    (comme Signal LP light — signal indépendant, purement momentum).
+    Peut être appelée plusieurs fois ; ne s'exécute réellement qu'une fois
+    que price_change_m3 ET price_change_m1 sont tous deux disponibles
+    (ils ne sont calculés qu'à la fin de analyser_metriques_etendues, une
+    fois la fenêtre des 180s écoulée), et ne se déclenche qu'une seule
+    fois par token."""
+    data = active_tokens.get(mint)
+    if not data or data.get("signal4_evalue"):
+        return
+
+    price_change_m3 = data.get("price_change_m3")
+    price_change_m1 = data.get("price_change_m1")
+
+    # Données pas encore toutes disponibles -> on retentera au prochain appel
+    if price_change_m3 is None or price_change_m1 is None:
+        return
+
+    data["signal4_evalue"] = True
+
+    if price_change_m3 < SIGNAL4_PRICE_CHANGE_M3_MIN or price_change_m1 < SIGNAL4_PRICE_CHANGE_M1_MIN:
+        print(
+            f"[signal4] {data['symbol']} ({mint}) rejeté — "
+            f"price_change_m3={price_change_m3} price_change_m1={price_change_m1}"
+        )
+        return
+
+    current_mc = mc_reference
+    if not current_mc:
+        pair = fetch_pair_data(mint)
+        current_mc = (pair.get("marketCap", 0) or pair.get("fdv", 0)) if pair else None
+    if not current_mc:
+        current_mc = data.get("initial_mc") or 1.0
+
+    valeur_txt = f"m3={price_change_m3}% / m1={price_change_m1}%"
+
+    ouvrir_position_signal(
+        mint, "signal4", "Signal 4 — Momentum M3+M1",
+        "price_change_m3 & price_change_m1", valeur_txt,
+        f"m3 ≥ {SIGNAL4_PRICE_CHANGE_M3_MIN}% et m1 ≥ {SIGNAL4_PRICE_CHANGE_M1_MIN}%",
         current_mc,
     )
 
@@ -1746,8 +1802,8 @@ def log_resultat_signal_csv(row):
 
 def log_resultats_signaux(mint, data, max_mc, row_rapport=None):
     """Écrit une ligne dans SIGNAUX_LOG_FILE pour chaque signal qui s'est
-    déclenché sur ce token (signal1, signal2, signal3, signal_lp_light),
-    avec le résultat des 3 variantes de trailing stop comparées
+    déclenché sur ce token (signal1, signal2, signal3, signal_lp_light,
+    signal4), avec le résultat des 3 variantes de trailing stop comparées
     (-25% / -30% / -40%). Les colonnes lp_locked_pct et mult_30s sont des
     métriques au niveau du token, déjà journalisées pour chaque ligne
     (utile en particulier pour signal3 / signal_lp_light).
@@ -1957,7 +2013,13 @@ def analyser_metriques_etendues(mint):
     # précis), on l'exécute ici avec les valeurs finales calculées.
     evaluer_signal3_si_pret(mint)
     evaluer_signal_lp_light_si_pret(mint)
-    evaluer_signaux_1_et_2(mint, price_change_m3, _valeur_au_plus_proche(180, 1))
+    mc_180 = _valeur_au_plus_proche(180, 1)
+    evaluer_signaux_1_et_2(mint, price_change_m3, mc_180)
+    # --- Signal 4 (entrée à 3min, momentum M3+M1) : price_change_m1 et
+    # price_change_m3 viennent d'être écrits ci-dessus dans active_tokens,
+    # c'est donc ici (et uniquement ici) qu'il peut être évalué pour la
+    # première fois avec des données complètes.
+    evaluer_signal4_si_pret(mint, mc_180)
 
     print(
         f"[metriques_etendues] {data.get('symbol')} ({mint}) — "
@@ -2065,9 +2127,10 @@ def essayer_alerter(mint, pair, source_url):
     profil_txt = "✅ Oui" if a_un_profil else "Non"
     # Note : aucune alerte Telegram n'est envoyée ici. Le token passe en
     # suivi silencieux ; les SEULES alertes envoyées sur Telegram sont
-    # celles des 4 signaux (voir evaluer_signal3_si_pret /
-    # evaluer_signal_lp_light_si_pret / evaluer_signaux_1_et_2),
-    # chacune uniquement si son propre critère est validé.
+    # celles des 5 signaux (voir evaluer_signal3_si_pret /
+    # evaluer_signal_lp_light_si_pret / evaluer_signaux_1_et_2 /
+    # evaluer_signal4_si_pret), chacune uniquement si son propre critère
+    # est validé.
     print(f"Suivi démarré (silencieux) pour : {symbol} ({mint}) — RugCheck score={rug_score} top10={top10_pct}%")
 
     active_tokens[mint] = {
@@ -2133,7 +2196,8 @@ def essayer_alerter(mint, pair, source_url):
         "signal3_evalue": False,
         "signal_lp_light_evalue": False,
         "signaux_1_2_evalues": False,
-        "positions": {},  # cle_signal ("signal1"/"signal2"/"signal3"/"signal_lp_light") -> dict de position simulée
+        "signal4_evalue": False,
+        "positions": {},  # cle_signal ("signal1"/"signal2"/"signal3"/"signal_lp_light"/"signal4") -> dict de position simulée
     }
     seen_mints.add(mint)
 
@@ -2358,10 +2422,10 @@ def monitor_ath():
                         active_tokens[mint]["position_statut"] = "expire_30min"
                 data = active_tokens[mint]
 
-                # --- Rapport 30 min : envoyé UNIQUEMENT si au moins un des 4
-                # signaux (signal1/signal2/signal3/signal_lp_light) a été
-                # validé sur ce token (donc au moins une position simulée
-                # ouverte dans data["positions"]). Les tokens suivis
+                # --- Rapport 30 min : envoyé UNIQUEMENT si au moins un des 5
+                # signaux (signal1/signal2/signal3/signal_lp_light/signal4)
+                # a été validé sur ce token (donc au moins une position
+                # simulée ouverte dans data["positions"]). Les tokens suivis
                 # silencieusement sans aucun signal déclenché ne génèrent
                 # plus aucune alerte. ---
                 positions_declenchees = data.get("positions") or {}
