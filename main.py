@@ -65,16 +65,13 @@ REJECT_TOP10_PCT = None
 REJECT_IF_INSIDERS = False
 
 # --- ANALYSE DES 20 PREMIÈRES SECONDES ---
-ANALYSE_20S_SAMPLE_INTERVAL = 2  # secondes entre 2 mesures
+# Intervalle allongé de 2s -> 3s pour réduire le volume d'appels API
+# DexScreener (fetch_pair_data) pendant la phase d'analyse initiale de
+# chaque token suivi — voir discussion sur le risque de dépassement des
+# rate limits (60 req/min profils/boosts, 300 req/min pairs) maintenant
+# que tous les tokens migrés sont suivis sans pré-filtre.
+ANALYSE_20S_SAMPLE_INTERVAL = 3  # secondes entre 2 mesures
 ANALYSE_20S_DURATION = 20  # durée totale observée
-
-# ============================================================
-# --- FILTRES DE TRIGGER (signal d'entrée optimisé) ---
-# ============================================================
-TRIGGER_PRICE_CHANGE_M5_MIN = 10
-TRIGGER_PRICE_CHANGE_M5_MAX = 50
-TRIGGER_TX_ACCEL_MIN = 1.2
-TRIGGER_BUY_RATIO_20S_MIN = 0.55
 
 
 def passe_filtres_triggers(market_cap, price_change_m5, tx_accel):
@@ -83,6 +80,15 @@ def passe_filtres_triggers(market_cap, price_change_m5, tx_accel):
     if tx_accel is None or tx_accel <= TRIGGER_TX_ACCEL_MIN:
         return False
     return True
+
+
+# ============================================================
+# --- FILTRES DE TRIGGER (signal d'entrée optimisé) ---
+# ============================================================
+TRIGGER_PRICE_CHANGE_M5_MIN = 10
+TRIGGER_PRICE_CHANGE_M5_MAX = 50
+TRIGGER_TX_ACCEL_MIN = 1.2
+TRIGGER_BUY_RATIO_20S_MIN = 0.55
 
 
 SIMULATION_SL_PCT = -0.25
@@ -1326,7 +1332,10 @@ def analyser_20_premieres_secondes(mint):
 
 
 METRIQUES_ETENDUES_DUREE = 180
-METRIQUES_ETENDUES_INTERVAL = 5
+# Intervalle allongé de 5s -> 10s pour réduire le volume d'appels API
+# DexScreener (fetch_pair_data) pendant la phase d'analyse étendue de
+# chaque token suivi — même raison que ANALYSE_20S_SAMPLE_INTERVAL.
+METRIQUES_ETENDUES_INTERVAL = 10
 
 
 # ============================================================
@@ -3005,3 +3014,4 @@ if __name__ == "__main__":
             print(f"[boucle_principale] ERREUR non gérée : {e}")
             traceback.print_exc()
         time.sleep(10)
+
