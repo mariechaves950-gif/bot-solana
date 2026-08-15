@@ -2057,9 +2057,11 @@ def essayer_alerter(mint, pair, source_url):
         print(f"[non migré] {symbol} ({mint}) — dex={pair.get('dexId')}")
         return False
 
-    if not passe_les_filtres(market_cap, liquidity_usd):
-        print(f"[filtré] {symbol} ({mint}) — MC=${market_cap:,.0f} Liq=${liquidity_usd:,.0f}")
-        return False
+    # --- Filtre liquidité (MIN_LIQUIDITY_USD / MIN_LIQUIDITY_RATIO) SUPPRIMÉ :
+    # demande explicite = suivre TOUS les tokens fraîchement migrés, sans
+    # pré-filtre autre que RugCheck (score ≤ 20 + LP locked) plus bas.
+    # passe_les_filtres() n'est plus appelée ici (elle reste définie plus
+    # haut dans le fichier si jamais tu veux la réactiver plus tard).
 
     txns = pair.get("txns") or {}
     volume = pair.get("volume") or {}
@@ -2071,16 +2073,14 @@ def essayer_alerter(mint, pair, source_url):
     tot_h1 = (txns_h1.get("buys") or 0) + (txns_h1.get("sells") or 0)
     tx_accel = round((tot_m5 * 12) / tot_h1, 3) if tot_h1 > 0 else None
 
-    if not passe_filtres_triggers(market_cap, price_change_m5, tx_accel):
-        print(f"[trigger] {symbol} ({mint}) rejeté — MC=${market_cap:,.0f} price_change_m5={price_change_m5} tx_accel={tx_accel}")
-        return False
+    # --- Filtre trigger (price_change_m5 / tx_accel) SUPPRIMÉ : ces valeurs
+    # continuent d'être CALCULÉES ci-dessus (elles servent au logging CSV,
+    # au calcul de l'ancien champ signal_valide, et aux Signaux 1/2/4), mais
+    # elles ne bloquent plus l'entrée en suivi d'un token.
 
-    # --- FILTRE D'ÂGE DU POOL (avant tout le reste, pour ne pas gaspiller
-    # d'appels API RugCheck sur de vieux tokens) ---
-    # Les signaux entrent à 30s ou 3 min APRÈS le début du suivi : ce suivi
-    # doit donc démarrer très tôt après la migration, sinon les alertes
-    # arrivent sur des tokens déjà anciens (vu en pratique : un pool de 29h
-    # avait quand même déclenché une alerte).
+    # --- FILTRE D'ÂGE DU POOL SUPPRIMÉ : pool_age_seconds continue d'être
+    # calculé (utile pour le CSV et pour is_golden_window), mais ne rejette
+    # plus aucun token, quel que soit son âge au moment de la migration.
     pair_created_at = pair.get("pairCreatedAt")
     pool_age_seconds = None
     if pair_created_at:
@@ -2088,17 +2088,6 @@ def essayer_alerter(mint, pair, source_url):
             pool_age_seconds = round(time.time() - (float(pair_created_at) / 1000))
         except (TypeError, ValueError):
             pool_age_seconds = None
-
-    if POOL_AGE_STRICT_FILTER:
-        if pool_age_seconds is None:
-            print(f"[pool_age] {symbol} ({mint}) rejeté — âge du pool inconnu")
-            return False
-        if pool_age_seconds > POOL_AGE_IDEAL_MAX_SECONDS:
-            print(
-                f"[pool_age] {symbol} ({mint}) rejeté — pool_age={pool_age_seconds}s "
-                f"(> {POOL_AGE_IDEAL_MAX_SECONDS}s), trop vieux pour un signal early-entry"
-            )
-            return False
 
     rug_ok, rug_score, rug_flags, top10_pct, insiders_detected, lp_locked_pct, total_holders, bundle_detected = rugcheck_verdict(mint)
     if not rug_ok:
