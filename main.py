@@ -1330,11 +1330,18 @@ METRIQUES_ETENDUES_INTERVAL = 5
 
 
 # ============================================================
-# --- SIGNAUX 1, 2, 3, 4 : entrée simulée + alerte Telegram + trailing stop ---
+# --- SIGNAUX 1, 2, 3, 4 : entrée simulée + trailing stop (SANS alerte Telegram) ---
 # ============================================================
 # Règles communes à tous les signaux : pas de TP plafonné — le stop suit le
 # prix (trailing) et remonte à chaque nouveau plus haut. On compare 3
 # distances de trailing en parallèle sur chaque signal : -25% / -30% / -40%.
+#
+# NOTE (désactivation temporaire des alertes Telegram, pour limiter les
+# appels API) : ouvrir_position_signal() n'envoie plus AUCUN message
+# Telegram. Toute la logique de simulation (ouverture de position,
+# trailing stop, journalisation CSV) reste intacte. Pour réactiver les
+# alertes, il suffit de dé-commenter le bloc d'envoi à la fin de la
+# fonction ci-dessous.
 SIGNAUX_SL_PCT = -0.25
 SIGNAUX_MAX_HOLD_MINUTES = 30
 SIGNAUX_MISE_USD = MISE_SIMULATION_USD  # mise fictive $100, comme les autres simulations
@@ -1405,9 +1412,13 @@ def _echapper_markdown(texte):
 
 
 def ouvrir_position_signal(mint, cle, nom_signal, formule_txt, valeur_calculee, seuil_txt, current_mc):
-    """Ouvre une position simulée pour un signal donné (si pas déjà ouverte)
-    et envoie immédiatement l'alerte Telegram correspondante, avec l'adresse
-    du token en bloc copiable (tap-to-copy sur Telegram).
+    """Ouvre une position simulée pour un signal donné (si pas déjà ouverte).
+
+    ALERTES TELEGRAM DÉSACTIVÉES (temporairement, pour limiter les appels
+    API) : la position est ouverte et suivie normalement (trailing stop,
+    journalisation CSV) mais plus aucun message n'est envoyé sur Telegram
+    ici. Pour réactiver, dé-commenter le bloc "ENVOI TELEGRAM" en bas de
+    la fonction.
 
     Chaque position suit 3 variantes de trailing stop en parallèle
     (-25% / -30% / -40% depuis le plus haut observé), actives dès l'entrée
@@ -1443,44 +1454,42 @@ def ouvrir_position_signal(mint, cle, nom_signal, formule_txt, valeur_calculee, 
         "trailing": trailing,
     }
 
-    print(f"[{cle}] {data['symbol']} ({mint}) — signal déclenché, position ouverte à ${entry_price:,.0f} (trailing 25/30/40%)")
+    print(f"[{cle}] {data['symbol']} ({mint}) — signal déclenché, position ouverte à ${entry_price:,.0f} (trailing 25/30/40%) — [alerte Telegram désactivée]")
 
-    variantes_txt = " / ".join(
-        f"{int(abs(pct) * 100)}%" for pct in SIGNAUX_TRAILING_VARIANTS.values()
-    )
-
-    # Âge réel du pool au moment où LE SIGNAL se déclenche (pas au moment
-    # de la détection initiale du token) : âge du pool à la détection +
-    # temps écoulé depuis le début du suivi jusqu'à l'entrée du signal.
-    pool_age_txt = "N/A"
-    pool_age_detection = data.get("pool_age_seconds")
-    entry_elapsed_s = round(time.time() - data["start_time"])
-    if pool_age_detection is not None:
-        age_total_s = pool_age_detection + entry_elapsed_s
-        minutes, secondes = divmod(age_total_s, 60)
-        pool_age_txt = f"{minutes}m{secondes:02d}s"
-
-    lignes = [
-        f"🎯 *{nom_signal} déclenché !*",
-        "",
-        f"🪙 Token : {_echapper_markdown(data['symbol'])}",
-        f"🏦 DEX : {_echapper_markdown(data.get('dex'))}",
-        f"🕒 Âge du pool à l'alerte : {pool_age_txt}",
-        f"📊 Formule : `{formule_txt}` = {valeur_calculee} (seuil {seuil_txt})",
-        f"💰 MC entrée (simulée) : ${entry_price:,.0f}",
-        f"📈 Trailing stop simulé (3 variantes comparées) : {variantes_txt} depuis le plus haut",
-        "",
-        "📋 *Adresse du token (appuyer pour copier)* :",
-        f"`{mint}`",
-        "",
-        f"🔗 [DexScreener]({_lien_dexscreener(mint)})",
-        f"⚡ [Trader sur Axiom]({_lien_axiom(mint)})",
-    ]
-    envoye = send_telegram_message("\n".join(lignes))
-    if envoye:
-        print(f"[{cle}] {data['symbol']} ({mint}) — !!! ALERTE TELEGRAM ENVOYÉE AVEC SUCCÈS !!!")
-    else:
-        print(f"[{cle}] {data['symbol']} ({mint}) — !!! ÉCHEC ENVOI ALERTE TELEGRAM, voir erreur juste au-dessus !!!")
+    # --- ENVOI TELEGRAM (désactivé) ---
+    # variantes_txt = " / ".join(
+    #     f"{int(abs(pct) * 100)}%" for pct in SIGNAUX_TRAILING_VARIANTS.values()
+    # )
+    #
+    # pool_age_txt = "N/A"
+    # pool_age_detection = data.get("pool_age_seconds")
+    # entry_elapsed_s = round(time.time() - data["start_time"])
+    # if pool_age_detection is not None:
+    #     age_total_s = pool_age_detection + entry_elapsed_s
+    #     minutes, secondes = divmod(age_total_s, 60)
+    #     pool_age_txt = f"{minutes}m{secondes:02d}s"
+    #
+    # lignes = [
+    #     f"🎯 *{nom_signal} déclenché !*",
+    #     "",
+    #     f"🪙 Token : {_echapper_markdown(data['symbol'])}",
+    #     f"🏦 DEX : {_echapper_markdown(data.get('dex'))}",
+    #     f"🕒 Âge du pool à l'alerte : {pool_age_txt}",
+    #     f"📊 Formule : `{formule_txt}` = {valeur_calculee} (seuil {seuil_txt})",
+    #     f"💰 MC entrée (simulée) : ${entry_price:,.0f}",
+    #     f"📈 Trailing stop simulé (3 variantes comparées) : {variantes_txt} depuis le plus haut",
+    #     "",
+    #     "📋 *Adresse du token (appuyer pour copier)* :",
+    #     f"`{mint}`",
+    #     "",
+    #     f"🔗 [DexScreener]({_lien_dexscreener(mint)})",
+    #     f"⚡ [Trader sur Axiom]({_lien_axiom(mint)})",
+    # ]
+    # envoye = send_telegram_message("\n".join(lignes))
+    # if envoye:
+    #     print(f"[{cle}] {data['symbol']} ({mint}) — !!! ALERTE TELEGRAM ENVOYÉE AVEC SUCCÈS !!!")
+    # else:
+    #     print(f"[{cle}] {data['symbol']} ({mint}) — !!! ÉCHEC ENVOI ALERTE TELEGRAM, voir erreur juste au-dessus !!!")
 
 
 def evaluer_signal3_si_pret(mint):
@@ -2126,11 +2135,11 @@ def essayer_alerter(mint, pair, source_url):
     boost_txt = f"⚡ Oui ({nombre_boosts_actifs})" if boost_detecte else "Non"
     profil_txt = "✅ Oui" if a_un_profil else "Non"
     # Note : aucune alerte Telegram n'est envoyée ici. Le token passe en
-    # suivi silencieux ; les SEULES alertes envoyées sur Telegram sont
-    # celles des 5 signaux (voir evaluer_signal3_si_pret /
+    # suivi silencieux ; les signaux (evaluer_signal3_si_pret /
     # evaluer_signal_lp_light_si_pret / evaluer_signaux_1_et_2 /
-    # evaluer_signal4_si_pret), chacune uniquement si son propre critère
-    # est validé.
+    # evaluer_signal4_si_pret) ouvrent bien des positions simulées quand
+    # leur critère est validé, mais n'envoient plus non plus de message
+    # Telegram (voir ouvrir_position_signal, alertes commentées).
     print(f"Suivi démarré (silencieux) pour : {symbol} ({mint}) — RugCheck score={rug_score} top10={top10_pct}%")
 
     active_tokens[mint] = {
@@ -2422,66 +2431,67 @@ def monitor_ath():
                         active_tokens[mint]["position_statut"] = "expire_30min"
                 data = active_tokens[mint]
 
-                # --- Rapport 30 min : envoyé UNIQUEMENT si au moins un des 5
-                # signaux (signal1/signal2/signal3/signal_lp_light/signal4)
-                # a été validé sur ce token (donc au moins une position
-                # simulée ouverte dans data["positions"]). Les tokens suivis
-                # silencieusement sans aucun signal déclenché ne génèrent
-                # plus aucune alerte. ---
+                # --- RAPPORT 30 MIN : ALERTE TELEGRAM DÉSACTIVÉE ---
+                # Auparavant, si au moins un des 5 signaux avait été
+                # déclenché sur ce token (positions_declenchees non vide),
+                # un message récapitulatif était envoyé sur Telegram. Pour
+                # limiter les appels API, cet envoi est désactivé : on se
+                # contente désormais de logger l'info en console. Tout le
+                # calcul (multiplicateur, résultats trailing, etc.) reste
+                # inchangé et continue d'être écrit dans les CSV plus bas.
+                # Pour réactiver, dé-commenter le bloc ci-dessous.
                 positions_declenchees = data.get("positions") or {}
                 if positions_declenchees:
-                    boost_txt_rapport = (
-                        f"Oui ({data.get('nombre_boosts_actifs', 0)})"
-                        if data.get("boost_detecte") else "Non"
+                    print(
+                        f"[monitor_ath] Suivi 30 min terminé pour : {data['symbol']} — "
+                        f"x{multiplicateur:,.2f} — {len(positions_declenchees)} signal(aux) validé(s) "
+                        f"— [alerte Telegram désactivée, voir CSV]"
                     )
-
-                    lignes_signaux = []
-                    for cle_pos, pos in positions_declenchees.items():
-                        trailing = pos.get("trailing", {})
-                        t25 = trailing.get("trail25", {})
-                        t30 = trailing.get("trail30", {})
-                        t40 = trailing.get("trail40", {})
-
-                        def _fmt(tv):
-                            pct = tv.get("resultat_pct")
-                            return f"{pct:+.1f}%" if pct is not None else "N/A"
-
-                        lignes_signaux.append(
-                            f"🎯 *{pos.get('nom')}* (entrée à {pos.get('entry_elapsed_s')}s, "
-                            f"MC ${pos.get('entry_price', 0):,.0f})\n"
-                            f"   ↳ Trailing 25% : {_fmt(t25)} ({t25.get('statut')}) | "
-                            f"30% : {_fmt(t30)} ({t30.get('statut')}) | "
-                            f"40% : {_fmt(t40)} ({t40.get('statut')})"
-                        )
-
-                    msg_rapport = (
-                        f"📋 *Rapport 30 min — signal(aux) validé(s)*\n\n"
-                        f"🪙 Token : {_echapper_markdown(data['symbol'])}\n"
-                        f"💰 Market Cap initial (à la migration) : ${initial_mc:,.0f}\n"
-                        f"🏆 Market Cap max atteint : ${max_mc:,.0f}\n"
-                        f"✖️ Multiplicateur : x{multiplicateur:,.2f}\n"
-                        f"🚀 Boosté : {boost_txt_rapport}\n\n"
-                        + "\n\n".join(lignes_signaux) +
-                        f"\n\n🔗 [Voir sur DexScreener]({dex_url})\n"
-                        f"⚡ [Trader sur Axiom](https://axiom.trade/meme/{mint})"
-                    )
-
-                    # --- CORRECTIF : Telegram refuse tout message texte de
-                    # plus de 4096 caractères. Sans troncature, un token
-                    # avec plusieurs signaux déclenchés en même temps
-                    # pouvait générer un message trop long : l'envoi
-                    # échouait alors silencieusement (l'erreur n'apparaît
-                    # que dans les logs Railway, jamais côté Telegram), et
-                    # le rapport 30 min n'arrivait jamais. ---
-                    LIMITE_TELEGRAM = 4000
-                    if len(msg_rapport) > LIMITE_TELEGRAM:
-                        msg_rapport = msg_rapport[:LIMITE_TELEGRAM] + "\n\n… (message tronqué, voir /csv_signaux pour le détail complet)"
-
-                    envoye_rapport = send_telegram_message(msg_rapport)
-                    if envoye_rapport:
-                        print(f"[monitor_ath] Rapport 30 min envoyé (signal validé) pour : {data['symbol']} — x{multiplicateur:,.2f}")
-                    else:
-                        print(f"[monitor_ath] !!! ÉCHEC ENVOI du rapport 30 min pour {data['symbol']} ({mint}), voir erreur juste au-dessus !!!")
+                    # boost_txt_rapport = (
+                    #     f"Oui ({data.get('nombre_boosts_actifs', 0)})"
+                    #     if data.get("boost_detecte") else "Non"
+                    # )
+                    #
+                    # lignes_signaux = []
+                    # for cle_pos, pos in positions_declenchees.items():
+                    #     trailing = pos.get("trailing", {})
+                    #     t25 = trailing.get("trail25", {})
+                    #     t30 = trailing.get("trail30", {})
+                    #     t40 = trailing.get("trail40", {})
+                    #
+                    #     def _fmt(tv):
+                    #         pct = tv.get("resultat_pct")
+                    #         return f"{pct:+.1f}%" if pct is not None else "N/A"
+                    #
+                    #     lignes_signaux.append(
+                    #         f"🎯 *{pos.get('nom')}* (entrée à {pos.get('entry_elapsed_s')}s, "
+                    #         f"MC ${pos.get('entry_price', 0):,.0f})\n"
+                    #         f"   ↳ Trailing 25% : {_fmt(t25)} ({t25.get('statut')}) | "
+                    #         f"30% : {_fmt(t30)} ({t30.get('statut')}) | "
+                    #         f"40% : {_fmt(t40)} ({t40.get('statut')})"
+                    #     )
+                    #
+                    # msg_rapport = (
+                    #     f"📋 *Rapport 30 min — signal(aux) validé(s)*\n\n"
+                    #     f"🪙 Token : {_echapper_markdown(data['symbol'])}\n"
+                    #     f"💰 Market Cap initial (à la migration) : ${initial_mc:,.0f}\n"
+                    #     f"🏆 Market Cap max atteint : ${max_mc:,.0f}\n"
+                    #     f"✖️ Multiplicateur : x{multiplicateur:,.2f}\n"
+                    #     f"🚀 Boosté : {boost_txt_rapport}\n\n"
+                    #     + "\n\n".join(lignes_signaux) +
+                    #     f"\n\n🔗 [Voir sur DexScreener]({dex_url})\n"
+                    #     f"⚡ [Trader sur Axiom](https://axiom.trade/meme/{mint})"
+                    # )
+                    #
+                    # LIMITE_TELEGRAM = 4000
+                    # if len(msg_rapport) > LIMITE_TELEGRAM:
+                    #     msg_rapport = msg_rapport[:LIMITE_TELEGRAM] + "\n\n… (message tronqué, voir /csv_signaux pour le détail complet)"
+                    #
+                    # envoye_rapport = send_telegram_message(msg_rapport)
+                    # if envoye_rapport:
+                    #     print(f"[monitor_ath] Rapport 30 min envoyé (signal validé) pour : {data['symbol']} — x{multiplicateur:,.2f}")
+                    # else:
+                    #     print(f"[monitor_ath] !!! ÉCHEC ENVOI du rapport 30 min pour {data['symbol']} ({mint}), voir erreur juste au-dessus !!!")
                 else:
                     print(f"[monitor_ath] Suivi 30 min terminé pour : {data['symbol']} — x{multiplicateur:,.2f} (aucun signal validé, pas d'alerte)")
 
